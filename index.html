@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Fractal</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+      body { font: 13px/1.45 system-ui, 'Segoe UI', sans-serif; color: #e8ecf4; }
+      #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+      .panel {
+        position: fixed; left: 14px; padding: 9px 13px; border-radius: 10px;
+        background: rgba(8, 10, 16, 0.58); backdrop-filter: blur(8px);
+        border: 1px solid rgba(255, 255, 255, 0.08); user-select: none;
+      }
+      #hud { top: 14px; display: flex; flex-direction: column; gap: 1px; pointer-events: none; min-width: 150px; }
+      #hud b { font-size: 17px; font-weight: 600; letter-spacing: 0.01em; font-variant-numeric: tabular-nums; }
+      #hud span { opacity: 0.72; font-variant-numeric: tabular-nums; }
+      #hud .dive { opacity: 1; color: #8fd0ff; }
+      #help { bottom: 14px; cursor: pointer; max-width: 330px; }
+      #help h1 { margin: 0; font-size: 12px; font-weight: 600; opacity: 0.75; }
+      #help dl { margin: 7px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+      #help dt { opacity: 0.95; white-space: nowrap; }
+      #help dd { margin: 0; opacity: 0.66; }
+      .helpless #help dl { display: none; }
+      #power { width: 44px; margin-left: 6px; padding: 1px 4px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.35); color: inherit; font: inherit; }
+      .clean .panel { display: none !important; }
+      #toast {
+        position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); padding: 7px 15px;
+        border-radius: 999px; background: rgba(8, 10, 16, 0.7); opacity: 0; transition: opacity 0.25s;
+        pointer-events: none;
+      }
+      #toast.show { opacity: 1; }
+      #fatal { position: fixed; inset: 0; display: grid; place-items: center; font-size: 16px; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="fatal"></div>
+    <div id="hud" class="panel"></div>
+    <div id="help" class="panel">
+      <h1>Управление</h1>
+      <dl>
+        <dt>Колесо</dt><dd>зум к курсору</dd>
+        <dt>Перетаскивание</dt><dd>движение</dd>
+        <dt>Двойной клик</dt><dd>погружение к точке</dd>
+        <dt>Двойной правый клик</dt><dd>отдаление</dd>
+        <dt>Пробел</dt><dd>автопогружение, колесо — скорость</dd>
+        <dt>WASD, Q / E</dt><dd>движение и зум, Shift — быстрее</dd>
+        <dt>1–0, N</dt><dd>палитра</dd>
+        <dt>P</dt><dd>переливы цвета</dd>
+        <dt>M</dt><dd>степень формулы <input id="power" type="number" min="2" max="10" step="1" value="2" /></dd>
+        <dt>[ ]</dt><dd>меньше / больше итераций</dd>
+        <dt>R · F · H</dt><dd>сброс · полный экран · скрыть панели</dd>
+      </dl>
+    </div>
+    <div id="toast"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
