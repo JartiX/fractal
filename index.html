@@ -23,7 +23,25 @@
       #help dt { opacity: 0.95; white-space: nowrap; }
       #help dd { margin: 0; opacity: 0.66; }
       .helpless #help dl { display: none; }
-      #power { width: 44px; margin-left: 6px; padding: 1px 4px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.35); color: inherit; font: inherit; }
+      #help input { padding: 1px 4px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.35); color: inherit; font: inherit; }
+      #power { width: 44px; margin-left: 6px; }
+      #vram { width: 64px; }
+      #vraminfo { display: block; }
+      #menu { left: auto; right: 14px; top: 14px; width: 292px; max-height: calc(100% - 28px); display: flex; flex-direction: column; padding: 0; }
+      #menu h1 { margin: 0; padding: 9px 13px; font-size: 12px; font-weight: 600; opacity: 0.8; cursor: pointer; display: flex; justify-content: space-between; }
+      #menu h1 small { font-weight: 400; opacity: 0.6; }
+      #menu .list { overflow-y: auto; padding: 0 7px 9px; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.25) transparent; }
+      #menu h2 { margin: 10px 6px 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.5; }
+      #menu button { display: block; width: 100%; text-align: left; padding: 5px 8px; border: 0; border-radius: 7px; background: none; color: inherit; font: inherit; cursor: pointer; }
+      #menu button:hover { background: rgba(255, 255, 255, 0.09); }
+      #menu button.on { background: rgba(120, 180, 255, 0.24); }
+      #menu button b { display: block; font-weight: 500; }
+      #menu button i { display: block; font-style: normal; font-size: 11.5px; opacity: 0.58; line-height: 1.3; }
+      #menu .chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 4px; }
+      #menu .chips button { width: auto; padding: 3px 9px; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 999px; font-size: 12px; }
+      #menu p { margin: 10px 6px 0; font-size: 11.5px; opacity: 0.55; }
+      .menuless #menu .list { display: none; }
+      #power:disabled { opacity: 0.4; }
       .clean .panel { display: none !important; }
       #toast {
         position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); padding: 7px 15px;
@@ -34,7 +52,7 @@
       #fatal { position: fixed; inset: 0; display: grid; place-items: center; font-size: 16px; pointer-events: none; }
     </style>
   </head>
-  <body>
+  <body class="helpless">
     <canvas id="view"></canvas>
     <div id="fatal"></div>
     <div id="hud" class="panel"></div>
@@ -49,11 +67,17 @@
         <dt>WASD, Q / E</dt><dd>движение и зум, Shift — быстрее</dd>
         <dt>1–0, N</dt><dd>палитра</dd>
         <dt>P</dt><dd>переливы цвета</dd>
+        <dt>Tab</dt><dd>меню фракталов</dd>
+        <dt>J</dt><dd>Жюлиа для точки под курсором</dd>
+        <dt>Правая кнопка + движение</dt><dd>менять параметр Жюлиа</dd>
+        <dt>K</dt><dd>плавное вращение параметра</dd>
         <dt>M</dt><dd>степень формулы <input id="power" type="number" min="2" max="10" step="1" value="2" /></dd>
         <dt>[ ]</dt><dd>меньше / больше итераций</dd>
+        <dt>Видеопамять</dt><dd><input id="vram" type="number" min="128" step="64" title="Сколько видеопамяти можно занять. Пусто или 0 — автоматически." /> МБ<span id="vraminfo"></span></dd>
         <dt>R · F · H</dt><dd>сброс · полный экран · скрыть панели</dd>
       </dl>
     </div>
+    <div id="menu" class="panel"></div>
     <div id="toast"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

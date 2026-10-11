@@ -12,9 +12,10 @@ const page = await browser.newPage();
 page.on('pageerror', (e) => console.log('[error]', e.message));
 await page.goto(url);
 await page.waitForFunction('window.__fx && window.__fx.idle()', { timeout: 60000, polling: 100 }).catch(() => console.log('not idle at start'));
+await page.keyboard.press('Space'); // start the autopilot the way a user does
 const res = await page.evaluate(async (secs, speed) => {
   const fx = window.__fx;
-  fx.dive.on = true; fx.dive.auto = true; fx.dive.speed = speed;
+  fx.dive.speed = speed;
   const dts = [], qs = [], gpu = [], scale = [];
   const ls0 = fx.view.ls;
   let last = performance.now(); const t0 = last;
@@ -26,7 +27,7 @@ const res = await page.evaluate(async (secs, speed) => {
     };
     requestAnimationFrame(tick);
   });
-  fx.dive.on = false;
+  fx.dive.on = false; fx.dive.speed = 0.7;
   await new Promise((r) => setTimeout(r, 1500));
   dts.shift();
   const s = [...dts].sort((a, b) => a - b);

@@ -1,26 +1,53 @@
-import { VERT, ITERATE, RESOLVE, COUNT, PROBE, DISPLAY } from './shaders';
-import { View, Point, cloneView, sameView, delta, offsetIn } from './view';
+import { VERT, iterateSrc, customSrc, RESOLVE, COUNT, EVENTS, PROBE, DISPLAY, DOWN, UP, FILL, MAXL } from './shaders';
+import { customInfo } from './custom';
+import { View, Point, cloneView, sameView, delta, offsetIn, fixedToDbl, pan, zoomAt } from './view';
+import { Spec, specKey, paramLc } from './formulas';
 import { PAL_SIZE } from './palettes';
 import type { RefResult, BlaData } from './refWorker';
 import { TEXW, EPS_L2 } from './refWorker';
 
+// The iteration limit grows by this factor for as long as patches of pixels are
+// still finishing in the upper half of the iterations done; once that half has
+// gone quiet, what is left is taken to be inside.
+const GROW = 1.5;
+const EV_W = 256; // room for the 16x16-block event map of a 4096x2304 job
+const EV_H = 144;
+// This many late finishers in one block make a patch still coming in. A thin rim
+// along a boundary (a couple of pixels wide) stays below it: chasing the last
+// pixel of a rim costs ten times the iterations and shows nothing new.
+const EV_PATCH = 48;
 const PROBE_W = 64;
 const PROBE_H = 36;
 
 export interface RefGpu extends Point {
   id: number;
   M: number;
+  lenA: number;
+  base: number;
+  cap: number;
+  spec: Spec;
+  tag: number;
+  perA: number;
+  perB: number;
+  interior: boolean;
+  uOff: number;
+  cref: [number, number, number, number]; // reference parameter split into float pairs (hi, lo)
+  lref: [number, number, number, number]; // its logarithm, likewise
+  kp: [number, number]; // (1 - C)/2 as a mantissa pair
+  ke: number; // and its exponent
+  cre: number; // the view-plane point as plain numbers
+  cim: number;
   escaped: boolean;
   maxIter: number;
   orbitTex: WebGLTexture;
   blaA: WebGLTexture | null;
+  blaB: WebGLTexture | null;
   blaE: WebGLTexture | null;
   blaOff: Int32Array;
   blaCnt: Int32Array;
   blaLevels: number;
   lcmax: number;
   lrMax: number;
-  power: number;
 }
 
 interface Job {
@@ -32,18 +59,36 @@ interface Job {
   motion: boolean;
   jitter: [number, number];
   refId: number;
-  N: number;
-  capped: boolean; // the reference is too short for the iterations this view wants
+  ref: RefGpu; // the orbit it runs on, which need not be the newest
+  N: number; // current iteration limit; grows while pixels keep finishing
+  N0: number; // limit the job started with
+  base: number; // limit the picture was expected to need, whatever a job it replaces had got to
+  Nprev: number; // limit before the latest extension
+  epoch: number; // bumped whenever N changes, to tell stale query results apart
+  stage: number; // 0 iterating, 1 asking whether to extend, 2 waiting for a longer reference orbit
+  final: boolean; // nothing more to learn: ready to become the finished picture
+  wantN: number; // limit it would like but the reference is too short for
+  lastActive: number; // fraction of pixels unfinished at the last probe
+  lastBusy: number; // highest limit at which patches were still finishing
   ec: number;
   sm: number;
   dm: [number, number];
+  lc: number; // log2 of the largest |dc| in the job
   useBla: boolean;
   front: number;
   passes: number;
   steps: number;
+  hsteps: number; // steps taken since N last changed
   K: number;
-  noneActive: boolean;
-  good: boolean;
+  noBudget: boolean; // every unfinished pixel has used up the current limit
+  tag: number;
+  layer: Layer | null; // where it is drawn (for extra samples: the picture they refine)
+  dirty: boolean; // has moved on since its layer was last written
+  src: Layer | null; // an earlier picture whose smooth parts it takes over instead of iterating
+  busyAt: number; // when patches were last seen finishing
+  roundAt: number; // when the limit was last raised
+  quiet: boolean; // gone quiet: what is unfinished is drawn as inside, though the job looks a little further
+  doubts: number; // rounds added only because a patch stayed unknown
   fracs: number[];
   t0: number;
 }
@@ -55,7 +100,28 @@ export interface ProbeResult {
   h: number;
   data: Float32Array; // PROBE_W * PROBE_H * 4: (nu | iter, status, -, -)
   active: number; // fraction of pixels still running
-  capped: boolean;
+}
+
+/** One picture of the stack: a rendering of `view`, finished or not, in one slice of the stack texture. */
+interface Layer {
+  slot: number;
+  view: View;
+  w: number;
+  h: number;
+  N: number; // iteration limit it was taken to
+  Naa: number; // limit that serves extra samples of it
+  tag: number;
+  complete: boolean; // a finished picture: nothing in it is still unknown
+  known: number; // share of its pixels that are known, roughly
+  born: number; // when it first came on screen (it fades in)
+  seq: number;
+}
+
+interface Half {
+  tex: WebGLTexture;
+  fbo: WebGLFramebuffer;
+  w: number;
+  h: number;
 }
 
 interface Target {
@@ -98,18 +164,33 @@ export class Renderer {
   biasMotion = 1;
   biasStatic = -3;
   lastJob = { passes: 0, steps: 0, ms: 0, w: 0, complete: false, fracs: [] as number[] };
-  stats = { steps: 0, passes: 0, samples: 0, scale: 1, busy: false, bla: false, gpuMs: 0 };
+  stats = { steps: 0, passes: 0, samples: 0, scale: 1, busy: false, bla: false, gpuMs: 0, restMs: 0, layers: 0, N: 0, deepening: false };
 
-  private prog!: { iterate: Program; resolve: Program; count: Program; probe: Program; display: Program };
+  private prog!: { iterate: Program; resolve: Program; count: Program; events: Program; probe: Program; display: Program; down: Program; up: Program; fill: Program };
+  private iterPrograms = new Map<string, Program>();
+  spec: Spec | null = null;
   private vao!: WebGLVertexArrayObject;
   private targets: Target[] = [];
-  private accTexs: WebGLTexture[] = []; // current picture and the previous one
-  private accCur = 0;
-  private prev: { view: View; w: number; h: number } | null = null;
-  private fadeStart = 0;
+  private stackTex!: WebGLTexture; // the layers: one float per pixel each (see RESOLVE)
+  private aaTex!: WebGLTexture; // extra jittered samples of the finished picture at rest
+  private layers: Layer[] = [];
+  private layerSeq = 0;
+  private showTag = -1; // which formula / parameter the layers on screen belong to
+  private exact: Layer | null = null; // the finished full-size picture of the view on screen
+  private aa = { layer: null as Layer | null, count: 0 };
+  private vel = { ls: 0, x: 0, y: 0 }; // how the view is moving, per millisecond
+  private lastView: View | null = null;
+  private lastT = 0;
+  private leadMs = 150; // how long a picture takes while moving: how far ahead the next one aims
   fadeMs = 90;
   private accFbo!: WebGLFramebuffer;
-  private acc = { view: null as View | null, w: 0, h: 0, count: 0, complete: false, N: 0 };
+  private aaTarget = 8; // samples wanted for the picture on screen
+  private compTex: WebGLTexture | null = null; // the composed picture: colour and coverage (see FILL)
+  private compFbo!: WebGLFramebuffer;
+  private pull: Half[] = []; // it halved again and again
+  private push: Half[] = []; // and each of those with its gaps filled from the coarser ones
+  private lx = new Float32Array(MAXL * 4);
+  private lsz = new Float32Array(MAXL * 4);
   private palTex!: WebGLTexture;
   private dummyTex!: WebGLTexture;
   private probeFbo!: WebGLFramebuffer;
@@ -119,8 +200,26 @@ export class Renderer {
   private probeBuf = new Float32Array(PROBE_W * PROBE_H * 4);
   private timerExt: any = null;
   private timers: { q: WebGLQuery; job: Job; first: boolean; K: number }[] = [];
-  private counts: { q: WebGLQuery; job: Job }[] = [];
+  private restQ: WebGLQuery | null = null; // times everything in a frame but the iterations
+  /** Length of a display frame in ms (0: unknown). */
+  frameMs = 0;
+  private counts: { q: WebGLQuery; job: Job; epoch: number }[] = [];
+  private evq: { sync: WebGLSync; job: Job; epoch: number; cw: number; ch: number } | null = null;
+  private evFbo!: WebGLFramebuffer;
+  private evTex!: WebGLTexture;
+  private evPbo!: WebGLBuffer;
+  private evBuf = new Float32Array(EV_W * EV_H * 4);
+  maxN = 6_000_000;
+  /** Largest texture side the GPU takes: bounds how long an orbit can be stored. */
+  maxTex = 4096;
+  /** Iterations the current view would like the reference orbit to cover. */
+  needIter = 0;
+  private need = 0; // limit the last finished picture actually needed
+  private needLs = 0;
+  private resumeN = 0; // limit a job had reached when its reference was replaced
+  private resumeBase = 0; // and what that job had expected to need
   private job: Job | null = null;
+  private oldRefs: RefGpu[] = []; // replaced orbits a job is still running on
   private jobSeq = 0;
   private c0 = 2e-7; // estimated ms per (step * pixel) with every pixel running
 
@@ -136,6 +235,7 @@ export class Renderer {
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Нет поддержки рендера в float-текстуры');
     this.gl = gl;
     this.timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     this.init();
   }
 
@@ -163,17 +263,17 @@ export class Renderer {
   private init(): void {
     const gl = this.gl;
     this.prog = {
-      iterate: this.compile(ITERATE, [
-        'uS0', 'uS1', 'uOrbit', 'uBlaA', 'uBlaE', 'uInit', 'uRefLen', 'uMaxIter', 'uSteps', 'uEc',
-        'uBlaLevels', 'uBlaOff', 'uBlaCnt', 'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uBlaBias', 'uEps2', 'uPow',
-      ]),
-      resolve: this.compile(RESOLVE, ['uS1', 'uOld', 'uOldOn', 'uOldInside', 'uGuessInside', 'uCapped', 'uOldX', 'uOldSize', 'uRes', 'uAspect']),
-      count: this.compile(COUNT, ['uS1']),
+      iterate: null as unknown as Program, // chosen by setFormula
+      resolve: this.compile(RESOLVE, ['uS1', 'uFinal']),
+      count: this.compile(COUNT, ['uS1', 'uN']),
+      events: this.compile(EVENTS, ['uS0', 'uS1', 'uT', 'uSize']),
       probe: this.compile(PROBE, ['uS1', 'uSize', 'uGrid']),
       display: this.compile(DISPLAY, [
-        'uAcc', 'uAccCount', 'uAccSize', 'uAccX', 'uPrev', 'uPrevOn', 'uPrevSize', 'uPrevX', 'uFade', 'uB', 'uBOn', 'uBCapped', 'uBSize', 'uBX', 'uPal', 'uRes',
-        'uAspect', 'uPhase', 'uDensity',
+        'uStack', 'uCount', 'uLX', 'uLS', 'uAA', 'uAACount', 'uDirect', 'uPal', 'uRes', 'uAspect', 'uPhase', 'uDensity',
       ]),
+      down: this.compile(DOWN, ['uSrc', 'uSize']),
+      up: this.compile(UP, ['uOwn', 'uUp', 'uSize', 'uTop']),
+      fill: this.compile(FILL, ['uC', 'uUp', 'uRes']),
     };
     this.vao = gl.createVertexArray()!;
     gl.bindVertexArray(this.vao);
@@ -196,6 +296,14 @@ export class Renderer {
     this.pbo = gl.createBuffer()!;
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.pbo);
     gl.bufferData(gl.PIXEL_PACK_BUFFER, this.probeBuf.byteLength, gl.STREAM_READ);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    this.evTex = this.floatTex(EV_W, EV_H, null);
+    this.evFbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.evFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.evTex, 0);
+    this.evPbo = gl.createBuffer()!;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.evPbo);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, this.evBuf.byteLength, gl.STREAM_READ);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     this.accFbo = gl.createFramebuffer()!;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -243,73 +351,220 @@ export class Renderer {
       this.targets.push({ fbo, s0, s1 });
     }
     this.maxSamples = w * h > 5_000_000 ? 4 : 8;
-    for (const t of this.accTexs) gl.deleteTexture(t);
-    this.accTexs = [];
-    for (let i = 0; i < 2; i++) {
+    const half = (cw: number, ch: number): Half => {
+      const tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, cw, ch);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const fbo = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      return { tex, fbo, w: cw, h: ch };
+    };
+    for (const x of [...this.pull, ...this.push]) {
+      gl.deleteTexture(x.tex);
+      gl.deleteFramebuffer(x.fbo);
+    }
+    if (this.compTex) {
+      gl.deleteTexture(this.compTex);
+      gl.deleteFramebuffer(this.compFbo);
+    }
+    const comp = half(w, h);
+    this.compTex = comp.tex;
+    this.compFbo = comp.fbo;
+    this.pull = [];
+    this.push = [];
+    for (let cw = w, ch = h; Math.max(cw, ch) > 6; ) {
+      cw = Math.max(1, Math.ceil(cw / 2));
+      ch = Math.max(1, Math.ceil(ch / 2));
+      this.pull.push(half(cw, ch));
+      this.push.push(half(cw, ch));
+    }
+    const arr = (old: WebGLTexture | undefined, n: number): WebGLTexture => {
+      if (old) gl.deleteTexture(old);
       const t = gl.createTexture()!;
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, t);
-      gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.R32F, w, h, this.maxSamples);
+      gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.R32F, w, h, n);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      this.accTexs.push(t);
-    }
+      return t;
+    };
+    this.stackTex = arr(this.stackTex, MAXL);
+    this.aaTex = arr(this.aaTex, this.maxSamples - 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.acc.count = 0;
-    this.prev = null;
+    this.layers = [];
+    this.aa = { layer: null, count: 0 };
+    this.exact = null;
     this.job = null;
+  }
+
+  /** Video memory the frame-sized buffers take, in bytes: what is left of a budget is for orbits. */
+  baseBytes(): number {
+    // iteration state (two pairs of RGBA32F), layers and extra samples (R32F), the
+    // composed picture with its halvings (RGBA16F), the canvas itself
+    return this.W * this.H * (64 + 4 * MAXL + 4 * (this.maxSamples - 1) + 8 * (1 + 2 / 3) + 8);
+  }
+
+  /** Name of the graphics card as the driver reports it ('' if hidden). */
+  gpuName(): string {
+    const e = this.gl.getExtension('WEBGL_debug_renderer_info');
+    return e ? String(this.gl.getParameter(e.UNMASKED_RENDERER_WEBGL)) : '';
+  }
+
+  /** Switch to another fractal; its shader is compiled on first use. */
+  setFormula(spec: Spec): void {
+    const key = specKey(spec);
+    let prog = this.iterPrograms.get(key);
+    if (!prog) {
+      prog =
+        spec.kind === 'custom'
+          ? this.compile(customSrc(spec.custom, customInfo(spec.custom)), [
+              'uS0', 'uS1', 'uOrbit', 'uInit', 'uRefLen', 'uEndA', 'uBase', 'uMaxIter', 'uSteps', 'uEc', 'uPow', 'uUOff',
+              'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uCref', 'uLref', 'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uAccLayer', 'uSrcX', 'uSrcSize',
+            ])
+          : this.compile(iterateSrc(spec), [
+              'uS0', 'uS1', 'uOrbit', 'uBlaA', 'uBlaE', 'uInit', 'uRefLen', 'uEndA', 'uBase', 'uMaxIter', 'uSteps', 'uEc',
+              'uBlaLevels', 'uBlaOff', 'uBlaCnt', 'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uBlaBias', 'uEps2', 'uPow',
+              'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uLP', 'uPH', 'uKp', 'uKe', 'uBlaB', 'uUOff', 'uAccLayer', 'uSrcX', 'uSrcSize',
+            ]);
+      this.iterPrograms.set(key, prog);
+    }
+    this.prog.iterate = prog;
+    this.spec = spec;
+    this.reset();
   }
 
   /** Forget everything drawn and the reference orbit (the formula changed). */
   reset(): void {
-    const gl = this.gl;
-    const old = this.ref;
-    if (old) {
-      gl.deleteTexture(old.orbitTex);
-      if (old.blaA) gl.deleteTexture(old.blaA);
-      if (old.blaE) gl.deleteTexture(old.blaE);
-    }
+    if (this.ref) this.oldRefs.push(this.ref);
+    this.job = null;
+    this.sweep();
     this.ref = null;
     this.job = null;
-    this.acc.count = 0;
-    this.prev = null;
+    this.layers = [];
+    this.aa = { layer: null, count: 0 };
+    this.exact = null;
+    this.showTag = -1;
+    this.need = 0;
+    this.resumeN = 0;
+    this.needIter = 0;
   }
 
   // --- reference data --------------------------------------------------------
 
-  setRef(r: RefResult): void {
+  /**
+   * Install a reference orbit. `same` says it is a longer orbit of the point the
+   * current one belongs to: a picture in progress then simply carries on with it.
+   * Returns false, changing nothing, if the card has no memory for it.
+   */
+  setRef(r: RefResult, same = false): boolean {
     const gl = this.gl;
     const old = this.ref;
+    const job = this.job;
+    while (gl.getError() !== gl.NO_ERROR); // only errors from here on are of interest
     const orbitTex = this.floatTex(TEXW, r.orbitRows, r.orbit);
+    const split = (v: number): [number, number] => {
+      const hi = Math.fround(v);
+      return [hi, Math.fround(v - hi)];
+    };
+    const cre = split(fixedToDbl(r.vx, r.prec, 0));
+    const cim = split(fixedToDbl(r.vy, r.prec, 0));
+    // (1 - C)/2 with its own exponent: it may be tiny when the view sits at c = 1
+    const kx = (1n << BigInt(r.prec)) - r.vx;
+    const ky = -r.vy;
+    const kbits = Math.max((kx < 0n ? -kx : kx).toString(2).length, (ky < 0n ? -ky : ky).toString(2).length);
+    const ksh = Math.max(0, kbits - 53);
+    const kden = Math.pow(2, kbits - ksh);
+    const kp: [number, number] = [Number(kx >> BigInt(ksh)) / kden, Number(ky >> BigInt(ksh)) / kden];
+    const ke = kbits - r.prec - 1;
+    const mod = Math.hypot(cre[0] + cre[1], cim[0] + cim[1]);
+    const lre = split(mod > 0 ? Math.log(mod) : 0);
+    const lim = split(mod > 0 ? Math.atan2(cim[0] + cim[1], cre[0] + cre[1]) : 0);
     this.ref = {
-      id: r.id, cx: r.cx, cy: r.cy, prec: r.prec, M: r.M, escaped: r.escaped, maxIter: r.maxIter,
-      orbitTex, blaA: null, blaE: null, blaOff: r.blaOff, blaCnt: r.blaCnt, blaLevels: 0, lcmax: r.lcmax, lrMax: r.lrMax, power: r.power,
+      id: r.id, cx: r.vx, cy: r.vy, prec: r.prec, kp, ke, cre: cre[0] + cre[1], cim: cim[0] + cim[1], M: r.M, lenA: r.lenA, base: r.base, cap: r.cap, spec: r.spec, tag: r.tag,
+      perA: r.perA, perB: r.perB, interior: r.interior, uOff: r.uOff, cref: [cre[0], cim[0], cre[1], cim[1]], lref: [lre[0], lim[0], lre[1], lim[1]],
+      escaped: r.escaped, maxIter: r.maxIter,
+      orbitTex, blaA: null, blaB: null, blaE: null, blaOff: r.blaOff, blaCnt: r.blaCnt, blaLevels: 0, lcmax: r.lcmax, lrMax: r.lrMax,
     };
     this.setBla(r);
-    if (old) {
-      gl.deleteTexture(old.orbitTex);
-      if (old.blaA) gl.deleteTexture(old.blaA);
-      if (old.blaE) gl.deleteTexture(old.blaE);
+    const nr = this.ref;
+    for (let err = gl.getError(); err !== gl.NO_ERROR; err = gl.getError()) {
+      if (err !== gl.OUT_OF_MEMORY) continue;
+      gl.deleteTexture(nr.orbitTex);
+      if (nr.blaA) gl.deleteTexture(nr.blaA);
+      if (nr.blaB) gl.deleteTexture(nr.blaB);
+      if (nr.blaE) gl.deleteTexture(nr.blaE);
+      this.ref = old;
+      return false;
     }
+    if (job && old && job.ref === old) {
+      if (same && !job.aa && old.base === 0 && nr.base === 0) {
+        // a longer orbit of the same point: the picture simply carries on with it
+        // (not so with two orbits in one table: the second one has moved along)
+        job.ref = nr;
+        job.refId = nr.id;
+        job.useBla = !this.noBla && r.spec.kind !== 'custom' && nr.blaLevels > 0 && job.lc <= nr.lcmax;
+        if (job.stage === 2 && nr.cap > job.N) this.extendTo(job, Math.min(job.wantN, nr.cap));
+      } else if (job.aa || nr.tag !== job.tag || job.stage === 2 || (!job.motion && job.lastActive > 0.15)) {
+        this.drop(job);
+        this.job = null;
+      }
+      // otherwise it finishes on the orbit it started with: that one is as true as
+      // the new, and starting over would throw the work away
+    }
+    if (old) this.oldRefs.push(old);
+    this.sweep();
+    return true;
   }
 
-  setBla(b: BlaData): void {
+  /** Free the orbits no job runs on any more. */
+  private sweep(): void {
+    const gl = this.gl;
+    const used = this.job ? this.job.ref : null;
+    this.oldRefs = this.oldRefs.filter((o) => {
+      if (o === used) return true;
+      gl.deleteTexture(o.orbitTex);
+      if (o.blaA) gl.deleteTexture(o.blaA);
+      if (o.blaB) gl.deleteTexture(o.blaB);
+      if (o.blaE) gl.deleteTexture(o.blaE);
+      return false;
+    });
+  }
+
+  /** Install a BLA table. A rebuilt table for the same orbit (`same`) is as good as the old one mid-picture. */
+  setBla(b: BlaData, same = false): void {
     const gl = this.gl;
     const ref = this.ref;
     if (!ref) return;
     if (ref.blaA) gl.deleteTexture(ref.blaA);
+    if (ref.blaB) gl.deleteTexture(ref.blaB);
     if (ref.blaE) gl.deleteTexture(ref.blaE);
     ref.blaA = b.blaA ? this.floatTex(TEXW, b.blaRows, b.blaA) : null;
+    ref.blaB = b.blaB ? this.floatTex(TEXW, b.blaRows, b.blaB) : null;
     ref.blaE = b.blaE ? this.floatTex(TEXW, b.blaRows, b.blaE) : null;
     ref.blaOff = b.blaOff;
     ref.blaCnt = b.blaCnt;
     ref.blaLevels = b.blaA ? b.blaLevels : 0;
     ref.lcmax = b.lcmax;
     ref.lrMax = b.lrMax;
-    // a running job keeps sampling the textures it started with, so restart it
-    if (this.job) {
-      if (!this.job.aa && this.job.passes > 0) this.promote(this.job, false);
-      this.job = null;
-    }
+    const job = this.job;
+    if (job && same && job.ref === ref) job.useBla = !this.noBla && ref.spec.kind !== 'custom' && ref.blaLevels > 0 && job.lc <= ref.lcmax;
+  }
+
+  private extendTo(job: Job, to: number): void {
+    job.Nprev = job.N;
+    job.N = Math.floor(to);
+    job.epoch++;
+    job.hsteps = 0;
+    job.noBudget = false;
+    job.roundAt = performance.now();
+    // every pixel that was waiting at the old limit runs again: start the steps per pass low
+    job.K = Math.max(8, Math.min(job.K, this.targetMs / (this.c0 * job.w * job.h * Math.max(0.02, job.lastActive))));
+    job.fracs = [];
+    job.stage = 0;
   }
 
   /** log2 of the largest |dc| a job at this view would use, and the offset to the reference. */
@@ -321,111 +576,398 @@ export class Renderer {
     const dm = delta(v, ref, ec);
     const aspect = this.W / this.H;
     const lc = ec + Math.log2(Math.hypot(dm[0], dm[1]) + Math.hypot(aspect, 1) * sm);
-    return { dm, lc };
+    return { dm, lc: paramLc(ref.spec, lc, ref.cre, ref.cim) };
   }
 
   // --- frame -----------------------------------------------------------------
 
+  /** True once something drawn with the current reference is on screen. */
+  settled(): boolean {
+    return !!this.ref && this.showTag === this.ref.tag && this.layers.length > 0;
+  }
+
+  /** The finished full-size picture of exactly this view, if the stack holds one. */
+  private exactLayer(now: View): Layer | null {
+    let best: Layer | null = null;
+    for (const L of this.layers) {
+      if (L.complete && L.w === this.W && L.h === this.H && L.tag === this.showTag && (!best || L.seq > best.seq) && sameView(L.view, now)) best = L;
+    }
+    return best;
+  }
+
   /** True when the picture for `now` is finished and nothing is left to refine. */
   idle(now: View): boolean {
-    const a = this.acc;
-    return !this.job && a.count >= this.maxSamples && !!a.view && sameView(a.view, now);
+    const e = this.exactLayer(now);
+    return !this.job && !!e && !!this.ref && e.tag === this.ref.tag && this.aa.layer === e && 1 + this.aa.count >= this.aaTarget;
+  }
+
+  /** Iteration limit of the finished picture on screen (0 if there is none). */
+  finalN(): number {
+    return this.exact ? this.exact.N : 0;
   }
 
   frame(now: View, isStatic: boolean, N: number): void {
+    const t = performance.now();
     this.pollQueries();
     this.pollProbe();
+    this.track(now, isStatic, t);
     const ref = this.ref;
     let job = this.job;
 
-    if (job && ref) {
-      const same = sameView(job.view, now);
-      const complete = job.noneActive || job.steps >= job.N + 2;
-      if (job.refId !== ref.id) {
-        if (!job.aa && job.passes > 0) this.promote(job, false);
-        job = null;
-      } else if (job.aa) {
-        if (!same) job = null;
-        else if (complete) {
-          this.resolve(job, this.acc.count);
-          this.acc.count++;
+    if (job) {
+      {
+        // the current limit is used up: every loop turn advances a pixel by at least one iteration
+        if (job.stage === 0 && job.passes > 0 && (job.noBudget || job.hsteps >= job.N - job.Nprev + 2)) this.limitReached(job);
+        const same = sameView(job.view, now);
+        if (job.final) {
+          this.finish(job, same, t);
           job = null;
-        }
-      } else if (complete) {
-        this.tuneScale(job, false);
-        this.promote(job, true);
-        job = null;
-      } else if (!same) {
-        const [dx, dy] = offsetIn(job.view, now);
-        const hard = Math.abs(now.ls - job.view.ls) > 0.6 || Math.hypot(dx, dy) > 0.5;
-        if (job.good || hard) {
-          this.tuneScale(job, !job.good);
-          this.promote(job, false);
+        } else if (job.aa) {
+          if (!same) job = null;
+        } else if (job.stage === 2 && job.ref !== ref) {
+          // it waits for a longer orbit, but only the newest one is ever made longer
+          this.drop(job);
+          job = null;
+        } else if (!same && this.stale(job, now, isStatic)) {
+          this.tuneScale(job, true);
+          this.drop(job);
           job = null;
         }
       }
     }
     if (!job && ref) job = this.startJob(now, isStatic, N, ref);
-    if (job && ref) this.pass(job, ref);
+    if (job && job.stage === 0) this.pass(job, job.ref);
+    if (!job && this.oldRefs.length) this.sweep();
+    const ext = this.timerExt;
+    const gl = this.gl;
+    let rq: WebGLQuery | null = null;
+    if (ext && !this.restQ) {
+      rq = gl.createQuery()!;
+      gl.beginQuery(ext.TIME_ELAPSED_EXT, rq);
+    }
+    // the picture in progress is on screen as it stands: what it knows is drawn, the rest shows through
+    if (job && !job.aa && job.dirty) this.snapshot(job, job.quiet && !job.motion, t);
     this.job = job;
+    this.exact = this.exactLayer(now);
 
     this.stats.busy = !!job;
-    this.stats.samples = this.acc.count;
-    this.stats.scale = job && !job.aa ? job.w / this.W : this.acc.count ? this.acc.w / this.W : 1;
+    this.stats.samples = this.exact ? (this.aa.layer === this.exact ? 1 + this.aa.count : 1) : 0;
+    this.stats.scale = job && !job.aa ? job.w / this.W : this.exact ? 1 : this.q;
     this.stats.bla = !!job && job.useBla;
-    this.display(now);
+    this.stats.N = job ? job.N : this.exact ? this.exact.N : 0;
+    this.stats.deepening = !!job && !job.aa && job.N > job.N0;
+    this.display(now, t);
+    if (rq) {
+      gl.endQuery(ext.TIME_ELAPSED_EXT);
+      this.restQ = rq;
+    }
+  }
+
+  /** Follow the view's motion, so that pictures can be aimed at where it is heading. */
+  private track(now: View, isStatic: boolean, t: number): void {
+    const lv = this.lastView;
+    const dt = t - this.lastT;
+    const v = this.vel;
+    let ok = false;
+    if (lv && !isStatic && dt > 0 && dt < 250) {
+      const [dx, dy] = offsetIn(lv, now);
+      const dl = now.ls - lv.ls;
+      if (Math.abs(dl) < 1.5 && Math.hypot(dx, dy) < 1.5) {
+        const k = 1 - Math.exp(-dt / 90);
+        v.ls += (dl / dt - v.ls) * k;
+        v.x += (dx / dt - v.x) * k;
+        v.y += (dy / dt - v.y) * k;
+        ok = true;
+      }
+    }
+    if (!ok) v.ls = v.x = v.y = 0;
+    this.lastView = cloneView(now);
+    this.lastT = t;
+  }
+
+  /** Octaves or screen heights per second the view is moving at. */
+  private speed(): number {
+    return (Math.abs(this.vel.ls) + 0.7 * Math.hypot(this.vel.x, this.vel.y)) * 1000;
+  }
+
+  /** The view a moving camera will show by the time a picture started now is ready. */
+  private ahead(now: View): View {
+    const v = this.vel;
+    const out = cloneView(now);
+    const lead = this.leadMs * (v.ls < 0 ? 1.2 : 1.6);
+    const dl = Math.max(-0.5, Math.min(0.5, v.ls * lead)); // half an octave ahead still covers half the screen
+    // the centre drifts in screen units, and those shrink or grow with the view
+    const f = Math.abs(dl) < 1e-3 ? 1 : (Math.pow(2, dl) - 1) / (dl * Math.LN2);
+    let sx = v.x * lead * f;
+    let sy = v.y * lead * f;
+    const s = Math.hypot(sx, sy);
+    if (s > 0.35) {
+      sx *= 0.35 / s;
+      sy *= 0.35 / s;
+    }
+    if (s > 1e-4) pan(out, sx, sy);
+    if (Math.abs(dl) > 1e-4) zoomAt(out, 0, 0, dl);
+    return out;
+  }
+
+  /** A picture in progress is for a view the screen has left: is it still worth finishing? */
+  private stale(job: Job, now: View, isStatic: boolean): boolean {
+    if (isStatic) return true; // the view has come to rest somewhere else
+    const d = job.view.ls - now.ls; // octaves the job is wider than the screen
+    const r = Math.pow(2, -d);
+    const [dx, dy] = offsetIn(job.view, now);
+    const a = this.W / this.H;
+    // how much of the smaller of the two, job and screen, lies within the other
+    const span = (c: number, half: number, lim: number) => Math.max(0, Math.min(c + half, lim) - Math.max(c - half, -lim));
+    const cover = (span(dx, r * a, a) * span(dy, r, 1)) / (4 * a * Math.min(1, r * r));
+    return job.motion ? d > 0.9 || d < -1.3 || cover < 0.5 : Math.abs(d) > 0.3 || cover < 0.8;
+  }
+
+  /** A job has ended with nothing more to learn. */
+  private finish(job: Job, same: boolean, t: number): void {
+    if (job.aa) {
+      const a = this.aa;
+      if (same && a.layer && a.layer === job.layer && a.count < this.maxSamples - 1) {
+        this.resolve(job, this.aaTex, a.count, true);
+        a.count++;
+      }
+      return;
+    }
+    this.tuneScale(job, false);
+    // only a picture made at rest may call what it has not finished inside
+    this.snapshot(job, !job.motion, t);
+    this.reveal(job);
+    const L = job.layer!;
+    L.complete = !job.motion;
+    L.known = L.complete ? 1 : 1 - job.lastActive;
+    // where the next picture starts: the last limit that was still needed
+    this.need = job.lastBusy > 0 ? job.lastBusy : Math.min(job.N, job.base) / 2;
+    this.needLs = job.view.ls;
+    // extra samples only smooth edges: the last busy limit serves them, and a
+    // picture that took long to finish gets fewer of them
+    L.Naa = Math.max(1, Math.min(job.N, Math.ceil(this.need)));
+    const ms = t - job.t0;
+    this.aaTarget = ms > 5000 ? 2 : ms > 1500 ? Math.min(4, this.maxSamples) : this.maxSamples;
+    if (job.motion) this.leadMs = Math.max(40, Math.min(900, this.leadMs + (ms - this.leadMs) * 0.4));
+    this.lastJob = { passes: job.passes, steps: job.steps, ms, w: job.w, complete: true, fracs: job.fracs };
+    if (L.complete) this.prune(L);
+  }
+
+  /** The layer a new picture of `view` (h pixels high) overlaps best, to take its smooth parts from. */
+  private source(view: View, h: number, tag: number): Layer | null {
+    const g = view.ls - Math.log2(h);
+    const a = this.W / this.H;
+    let best: Layer | null = null;
+    for (const L of this.layers) {
+      if (L.tag !== tag || L.tag !== this.showTag) continue;
+      const d = L.view.ls - Math.log2(L.h) - g; // octaves coarser than the new picture
+      if (d > 1.2 || d < -2) continue;
+      const r = Math.pow(2, view.ls - L.view.ls);
+      const [dx, dy] = offsetIn(L.view, view);
+      if (Math.abs(dx) > a * (0.5 + r) || Math.abs(dy) > 0.5 + r) continue; // hardly overlaps
+      if (!best || L.seq > best.seq) best = L;
+    }
+    return best;
+  }
+
+  /** Give a job up. What it has found stays on screen as a layer. */
+  private drop(job: Job): void {
+    if (job.aa) return;
+    this.resumeN = Math.max(this.resumeN, job.N, job.wantN);
+    this.resumeBase = Math.max(job.lastBusy, job.base);
+    const L = job.layer;
+    if (L && L.known < 0.02 && this.layers.some((x) => x !== L && x.tag === L.tag)) {
+      // it has learnt nothing: its layer would only take a place in the stack
+      this.layers = this.layers.filter((x) => x !== L);
+      job.layer = null;
+    }
+    this.reveal(job);
+    this.lastJob = { passes: job.passes, steps: job.steps, ms: performance.now() - job.t0, w: job.w, complete: false, fracs: job.fracs };
+  }
+
+  /** Put a job's layer on screen although it shows another formula or parameter than what is there. */
+  private reveal(job: Job): void {
+    const L = job.layer;
+    if (!L || L.tag === this.showTag) return;
+    this.showTag = L.tag;
+    this.layers = this.layers.filter((x) => x.tag === L.tag);
+    if (this.aa.layer && this.aa.layer.tag !== L.tag) this.aa = { layer: null, count: 0 };
+    L.born = 0; // nothing of the old picture is left to fade from
+  }
+
+  /** Every unfinished pixel has had `job.N` iterations. Finish, or find out whether more would change anything. */
+  private limitReached(job: Job): void {
+    if (job.aa) {
+      job.final = true;
+      return;
+    }
+    const gl = this.gl;
+    this.reveal(job); // show what there is while the question is open
+    if (this.evq) gl.deleteSync(this.evq.sync);
+    const t = this.targets[job.front];
+    const { p, u } = this.prog.events;
+    const cw = Math.min(EV_W, Math.ceil(job.w / 16));
+    const ch = Math.min(EV_H, Math.ceil(job.h / 16));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.evFbo);
+    gl.viewport(0, 0, cw, ch);
+    gl.useProgram(p);
+    this.bindTex(0, gl.TEXTURE_2D, t.s0);
+    this.bindTex(1, gl.TEXTURE_2D, t.s1);
+    gl.uniform1i(u.uS0, 0);
+    gl.uniform1i(u.uS1, 1);
+    gl.uniform1f(u.uT, job.N / 2);
+    gl.uniform2i(u.uSize, job.w, job.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.evPbo);
+    gl.readPixels(0, 0, cw, ch, gl.RGBA, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)!;
+    gl.flush();
+    this.evq = { sync, job, epoch: job.epoch, cw, ch };
+    job.stage = 1;
+  }
+
+  /**
+   * The answer to limitReached: how many pixels finished late and how bunched they
+   * are; how many are still unknown, and the most of them in one block.
+   */
+  private decide(job: Job, total: number, densest: number, unknown: number, patch: number): void {
+    const ref: RefGpu | null = job.ref;
+    const now = performance.now();
+    // Patches still coming in, or simply a lot of pixels: the tail is not over.
+    // But a round has to be worth its time: the longer the last one took, the more
+    // it must have brought. A boundary, and dust above all, sheds stray pixels for
+    // ever, each batch dearer than the one before; chasing them shows nothing new.
+    const sec = (now - job.roundAt) / 1000;
+    let more = densest >= EV_PATCH * Math.max(1, sec / 1.5) || total >= job.w * job.h * 0.004 * Math.max(1, sec / 0.15);
+    if (more) {
+      job.lastBusy = job.N;
+      job.busyAt = now;
+    }
+    // A whole patch neither escaped nor proven inside. For an analytic formula that
+    // is suspect - there the inside proves itself (the contraction test) - so more
+    // likely the limit falls short of a later wave of escapes: look a good deal
+    // further before calling it inside. Folded and other formulas do have insides
+    // that prove nothing (bounded chaos): there it is drawn as inside from the first
+    // limit on, and checked a little further.
+    // (All this is for a picture at rest; one made on the move has no time to doubt.)
+    const analytic = !!ref && ref.spec.kind === 'power';
+    const since = Math.max(1, job.busyAt - job.t0);
+    if (!more && !job.motion && patch >= 192 && job.N < Math.max(job.lastBusy, job.base) * (analytic ? 16 : 4) && now - job.busyAt < (analytic ? Math.max(2500, Math.min(8000, since * 2)) : 1200)) {
+      more = true;
+      job.doubts++;
+    }
+    // ...and after looking twice in vain it is drawn as inside there too, while the look goes on
+    if (patch >= 192 && (!analytic || job.doubts >= 2)) job.quiet = true;
+    // Nothing at all has finished and nothing proves the view lies inside the set:
+    // the limit may simply be below the first escape. Keep looking for a while.
+    if (!more && job.lastActive >= 1 && ref && !ref.interior && job.N < job.base * 8) more = true;
+    let next = Math.min(this.maxN, Math.ceil(job.N * GROW));
+    // the reference point is one of the pixels: if it escapes at n, the limit must clear n
+    // (an orbit may have grown under the job since it chose its limit)
+    const clear = ref && ref.escaped && ref.base === 0 ? Math.min(this.maxN, Math.ceil(ref.lenA * 1.2)) : 0;
+    if (job.N < clear) {
+      more = true;
+      next = Math.max(next, clear);
+    }
+    if (!more || next <= job.N || !ref) {
+      job.final = true;
+      return;
+    }
+    const to = Math.min(next, ref.cap);
+    if (to > job.N) this.extendTo(job, to);
+    else {
+      // the reference orbit itself is not long enough: ask for a longer one and wait
+      job.wantN = next;
+      job.stage = 2;
+      this.needIter = Math.max(this.needIter, next * GROW);
+    }
   }
 
   private tuneScale(job: Job, forced: boolean): void {
     if (!job.motion) return;
-    // aim for a new picture roughly every 60-110 ms while moving
+    // A picture should be ready before the view has moved half an octave on: the
+    // faster the motion, the coarser the pictures. (Shorter ones would each be
+    // fresher but so much coarser that the screen ends up softer.)
     const ms = performance.now() - job.t0;
-    if (forced || ms > 110) this.q = Math.max(0.3, this.q * 0.88);
-    else if (ms < 60) this.q = Math.min(1, this.q * 1.1);
+    const hi = Math.max(160, Math.min(900, 550 / Math.max(this.speed(), 0.01)));
+    if (forced || ms > hi) this.q = Math.max(0.33, this.q * 0.85);
+    else if (ms < hi * 0.5) this.q = Math.min(1, this.q * 1.12);
+    if (forced && ms > this.leadMs) this.leadMs = Math.min(900, this.leadMs + (ms - this.leadMs) * 0.4);
   }
 
   private startJob(now: View, isStatic: boolean, N: number, ref: RefGpu): Job | null {
-    const off = this.refOffset(now)!;
-    const dmLen = Math.hypot(off.dm[0], off.dm[1]);
-    if (!Number.isFinite(dmLen) || dmLen > 3000 || ref.prec < -now.ls + 40) return null;
-
-    const acc = this.acc;
-    const full = acc.w === this.W && acc.h === this.H;
-    const exact = acc.count > 0 && acc.complete && full && sameView(acc.view!, now);
+    const exact = this.exactLayer(now);
     let aa = false;
     let q = isStatic ? 1 : this.q;
     let jitter: [number, number] = [0, 0];
-    if (exact) {
-      if (!isStatic || acc.count >= this.maxSamples) return null;
+    if (exact && exact.tag === ref.tag) {
+      if (!isStatic) return null;
+      if (this.aa.layer !== exact) this.aa = { layer: exact, count: 0 };
+      const n = 1 + this.aa.count;
+      if (n >= this.aaTarget) return null;
       aa = true;
       q = 1;
-      jitter = [halton(acc.count, 2) - 0.5, halton(acc.count, 3) - 0.5];
+      jitter = [halton(n, 2) - 0.5, halton(n, 3) - 0.5];
     }
+    // while moving, aim at where the view will be when the picture is ready
+    const view = aa || isStatic ? cloneView(now) : this.ahead(now);
+    const off = this.refOffset(view)!;
+    const dmLen = Math.hypot(off.dm[0], off.dm[1]);
+    if (!Number.isFinite(dmLen) || dmLen > 3000 || ref.prec < -view.ls + 40) return null;
     const w = Math.max(32, Math.round(this.W * q));
     const h = Math.max(32, Math.round(this.H * q));
-    const ec = Math.floor(now.ls);
-    const maxIter = ref.escaped ? N : Math.min(N, ref.M - 1);
+    const ec = Math.floor(view.ls);
+    // the reference point is one of the pixels: if it escapes at n, the limit must clear n
+    const floor = Math.max(N, ref.escaped && ref.base === 0 ? Math.ceil(ref.lenA * 1.2) : 0);
+    if (Math.abs(now.ls - this.needLs) > 4) this.need = 0;
+    const want = aa ? exact!.Naa : Math.max(floor, this.need, this.resumeN);
+    const base = !aa && this.resumeBase > 0 ? Math.min(this.resumeBase, want) : want;
+    if (!aa) {
+      this.resumeN = 0;
+      this.resumeBase = 0;
+      this.needIter = Math.min(this.maxN, want * GROW);
+    }
+    const maxIter = Math.max(1, Math.min(want, ref.cap, this.maxN));
     return {
       id: ++this.jobSeq,
-      view: cloneView(now),
+      view,
       w,
       h,
       aa,
       motion: !isStatic,
       jitter,
       refId: ref.id,
+      ref,
       N: maxIter,
-      capped: maxIter < N,
+      N0: maxIter,
+      base: Math.max(1, Math.min(base, maxIter)),
+      Nprev: 0,
+      epoch: 0,
+      stage: 0,
+      final: false,
+      wantN: 0,
+      lastActive: 1,
+      lastBusy: 0,
       ec,
-      sm: Math.pow(2, now.ls - ec),
+      sm: Math.pow(2, view.ls - ec),
       dm: off.dm,
-      useBla: !this.noBla && ref.blaLevels > 0 && off.lc <= ref.lcmax,
+      lc: off.lc,
+      useBla: !this.noBla && ref.spec.kind !== 'custom' && ref.blaLevels > 0 && off.lc <= ref.lcmax,
       front: 0,
       passes: 0,
       steps: 0,
+      hsteps: 0,
       K: Math.max(8, Math.min(4096, Math.round(this.targetMs / (this.c0 * w * h)))),
-      noneActive: false,
-      good: false,
+      noBudget: false,
+      tag: ref.tag,
+      layer: aa ? exact : null,
+      dirty: false,
+      src: aa || isStatic ? null : this.source(view, h, ref.tag),
+      busyAt: performance.now(),
+      roundAt: performance.now(),
+      quiet: false,
+      doubts: 0,
       fracs: [],
       t0: performance.now(),
     };
@@ -452,6 +994,8 @@ export class Renderer {
     this.bindTex(2, gl.TEXTURE_2D, ref.orbitTex);
     this.bindTex(3, gl.TEXTURE_2D, ref.blaA || this.dummyTex);
     this.bindTex(4, gl.TEXTURE_2D, ref.blaE || this.dummyTex);
+    this.bindTex(6, gl.TEXTURE_2D, ref.blaB || this.dummyTex);
+    gl.uniform1i(u.uBlaB, 6);
     gl.uniform1i(u.uS0, 0);
     gl.uniform1i(u.uS1, 1);
     gl.uniform1i(u.uOrbit, 2);
@@ -459,6 +1003,8 @@ export class Renderer {
     gl.uniform1i(u.uBlaE, 4);
     gl.uniform1i(u.uInit, job.passes === 0 ? 1 : 0);
     gl.uniform1i(u.uRefLen, ref.M);
+    gl.uniform1i(u.uEndA, ref.lenA - 1);
+    gl.uniform1i(u.uBase, ref.base);
     gl.uniform1i(u.uMaxIter, job.N);
     gl.uniform1i(u.uSteps, K);
     gl.uniform1i(u.uEc, job.ec);
@@ -470,9 +1016,32 @@ export class Renderer {
     gl.uniform2f(u.uDm, job.dm[0], job.dm[1]);
     gl.uniform1f(u.uAspect, this.W / this.H);
     gl.uniform1f(u.uSm, job.sm);
-    gl.uniform1i(u.uPow, ref.power);
+    gl.uniform1i(u.uPow, ref.spec.power);
+    gl.uniform1f(u.uLP, Math.log2(ref.spec.power));
+    gl.uniform2f(u.uKp, ref.kp[0], ref.kp[1]);
+    gl.uniform1i(u.uKe, ref.ke);
+    gl.uniform1f(u.uPH, (ref.spec.power - 1) / 2);
+    gl.uniform1i(u.uUOff, ref.uOff);
+    gl.uniform1i(u.uPerA, ref.perA);
+    gl.uniform1i(u.uPerB, ref.perB);
+    // extra samples skip what the finished picture shows to be well inside
+    this.bindTex(5, gl.TEXTURE_2D_ARRAY, this.stackTex);
+    gl.uniform1i(u.uAccTex, 5);
+    const from = job.aa ? job.layer : job.passes === 0 ? job.src : null;
+    gl.uniform1i(u.uAccLayer, from ? from.slot : 0);
+    gl.uniform1i(u.uSkipIn, !from ? 0 : job.aa ? 1 : 2);
+    if (from && !job.aa) {
+      const [dx, dy] = offsetIn(from.view, job.view);
+      gl.uniform4f(u.uSrcX, Math.pow(2, job.view.ls - from.view.ls), dx, dy, 0);
+      gl.uniform2f(u.uSrcSize, from.w, from.h);
+    }
+    gl.uniform2i(u.uAccMax, job.w - 1, job.h - 1);
+    gl.uniform4f(u.uCref, ref.cref[0], ref.cref[1], ref.cref[2], ref.cref[3]);
+    gl.uniform4f(u.uLref, ref.lref[0], ref.lref[1], ref.lref[2], ref.lref[3]);
     // looser linearisation while moving (faster), tighter for the resting picture
-    const bias = job.motion ? this.biasMotion : this.biasStatic;
+    // a fold's distance does not stretch with the tolerance: never widen for folded formulas
+    const bias0 = job.motion ? this.biasMotion : this.biasStatic;
+    const bias = ref.spec.kind === 'abs' ? Math.min(0, bias0) : bias0;
     gl.uniform1f(u.uBlaBias, bias);
     gl.uniform1f(u.uEps2, Math.pow(2, 2 * (EPS_L2 + bias)));
 
@@ -488,13 +1057,20 @@ export class Renderer {
       this.timers.push({ q: tq, job, first: job.passes === 0, K });
     }
     job.front = 1 - job.front;
+    job.dirty = true;
     job.passes++;
     job.steps += K;
+    job.hsteps += K;
     this.stats.steps = K;
     this.stats.passes = job.passes;
-    if (!ext) job.K = Math.min(32768, job.K * 1.25);
+    if (!ext) job.K = Math.min(262144, job.K * 1.25);
 
-    // is anything still running?
+    this.afterPass(job, dst);
+  }
+
+  private afterPass(job: Job, dst: Target): void {
+    const gl = this.gl;
+    // is any pixel still running with iterations left under the limit?
     if (this.counts.length < 4) {
       const cq = gl.createQuery()!;
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -502,11 +1078,12 @@ export class Renderer {
       gl.useProgram(this.prog.count.p);
       this.bindTex(0, gl.TEXTURE_2D, dst.s1);
       gl.uniform1i(this.prog.count.u.uS1, 0);
+      gl.uniform1f(this.prog.count.u.uN, job.N);
       gl.beginQuery(gl.ANY_SAMPLES_PASSED, cq);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       gl.endQuery(gl.ANY_SAMPLES_PASSED);
       gl.colorMask(true, true, true, true);
-      this.counts.push({ q: cq, job });
+      this.counts.push({ q: cq, job, epoch: job.epoch });
     }
 
     if (!this.probePending && !job.aa) {
@@ -545,21 +1122,52 @@ export class Renderer {
       gl.deleteQuery(t.q);
       if (gl.getParameter(ext.GPU_DISJOINT_EXT) || !(ms > 0)) continue;
       this.stats.gpuMs = ms;
-      if (t.first) {
+      if (t.first && !t.job.src && !t.job.aa) {
+        // (a pass that takes pixels over from an earlier picture says nothing about the cost of a step)
         const c = ms / (t.K * t.job.w * t.job.h);
         this.c0 = this.c0 * 0.5 + c * 0.5;
       }
       if (t.job === this.job) {
         const want = (t.K * this.targetMs) / Math.max(ms, 0.05);
-        t.job.K = Math.max(8, Math.min(32768, Math.min(want, t.job.K * 2)));
+        t.job.K = Math.max(8, Math.min(262144, Math.min(want, t.job.K * 2)));
       }
+    }
+    if (this.restQ && gl.getQueryParameter(this.restQ, gl.QUERY_RESULT_AVAILABLE)) {
+      const ms = gl.getQueryParameter(this.restQ, gl.QUERY_RESULT) / 1e6;
+      gl.deleteQuery(this.restQ);
+      this.restQ = null;
+      if (!gl.getParameter(ext.GPU_DISJOINT_EXT) && ms > 0) this.stats.restMs += (ms - this.stats.restMs) * 0.2;
     }
     while (this.counts.length) {
       const c = this.counts[0];
       if (!gl.getQueryParameter(c.q, gl.QUERY_RESULT_AVAILABLE)) break;
       this.counts.shift();
-      if (!gl.getQueryParameter(c.q, gl.QUERY_RESULT)) c.job.noneActive = true;
+      if (!gl.getQueryParameter(c.q, gl.QUERY_RESULT) && c.epoch === c.job.epoch) c.job.noBudget = true;
       gl.deleteQuery(c.q);
+    }
+    const ev = this.evq;
+    if (ev && gl.getSyncParameter(ev.sync, gl.SYNC_STATUS) === gl.SIGNALED) {
+      this.evq = null;
+      const n = ev.cw * ev.ch * 4;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.evPbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this.evBuf, 0, n);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      gl.deleteSync(ev.sync);
+      let total = 0;
+      let densest = 0;
+      let unknown = 0;
+      let patch = 0;
+      for (let i = 0; i < n; i += 4) {
+        const v = this.evBuf[i];
+        const q = this.evBuf[i + 1];
+        total += v;
+        unknown += q;
+        if (q > patch) patch = q;
+        // a patch coming in is a block whose late pixels finish close together;
+        // dust sheds its pixels at any count whatever, round after round
+        if (v > densest && this.evBuf[i + 3] - this.evBuf[i + 2] <= 0.15 * ev.job.N) densest = v;
+      }
+      if (ev.job === this.job && ev.epoch === ev.job.epoch && ev.job.stage === 1) this.decide(ev.job, total, densest, unknown, patch);
     }
   }
 
@@ -578,110 +1186,210 @@ export class Renderer {
     let active = 0;
     for (let i = 1; i < d.length; i += 4) if (d[i] === 0) active++;
     const f = active / (PROBE_W * PROBE_H);
+    job.lastActive = f;
+    if (job.layer && !job.aa) job.layer.known = 1 - f;
     job.fracs.push(f);
     job.fracs.push(job.steps);
-    // "good enough" to hand over while moving: nearly everything is done, or a
-    // quarter more work has stopped finishing pixels (the rest is deep or inside)
-    if (f < 0.02) job.good = true;
-    else if (f < 0.6) {
-      for (let i = job.fracs.length - 4; i >= 0; i -= 2) {
-        if (job.fracs[i + 1] <= job.steps * 0.8) {
-          if (job.fracs[i] - f < 0.01) job.good = true;
-          break;
-        }
-      }
-    }
-    if (this.onProbe) this.onProbe({ view: job.view, aspect: this.W / this.H, w: job.w, h: job.h, data: d, active: f, capped: job.capped });
+    if (this.onProbe) this.onProbe({ view: job.view, aspect: this.W / this.H, w: job.w, h: job.h, data: d, active: f });
   }
 
-  /** Writes the job into `layer` of the current picture; `inherit` fills unfinished pixels from the other one. */
-  private resolve(job: Job, layer: number, inherit = false): void {
+  /** Writes a job as it stands into one slice of `tex`. */
+  private resolve(job: Job, tex: WebGLTexture, slot: number, final: boolean): void {
     const gl = this.gl;
     const { p, u } = this.prog.resolve;
-    const acc = this.acc;
-    const ox = inherit && acc.count && acc.view ? this.layerXform(job.view, acc.view) : null;
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accFbo);
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, this.accTexs[this.accCur], 0, layer);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, slot);
     gl.viewport(0, 0, job.w, job.h);
     gl.useProgram(p);
     this.bindTex(0, gl.TEXTURE_2D, this.targets[job.front].s1);
-    this.bindTex(1, gl.TEXTURE_2D_ARRAY, this.accTexs[1 - this.accCur]);
     gl.uniform1i(u.uS1, 0);
-    gl.uniform1i(u.uOld, 1);
-    gl.uniform1i(u.uOldOn, ox ? 1 : 0);
-    gl.uniform1i(u.uOldInside, acc.N >= job.N * 0.9 ? 1 : 0);
-    gl.uniform1i(u.uCapped, job.capped ? 1 : 0);
-    gl.uniform1i(u.uGuessInside, job.good && !job.capped ? 1 : 0);
-    if (ox) {
-      gl.uniform4f(u.uOldX, ox[0], ox[1], ox[2], ox[3]);
-      gl.uniform2f(u.uOldSize, acc.w, acc.h);
-    }
-    gl.uniform2f(u.uRes, job.w, job.h);
-    gl.uniform1f(u.uAspect, this.W / this.H);
+    gl.uniform1i(u.uFinal, final ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
-  private promote(job: Job, complete: boolean): void {
-    this.lastJob = { passes: job.passes, steps: job.steps, ms: performance.now() - job.t0, w: job.w, complete, fracs: job.fracs };
-    this.prev = this.acc.count && this.acc.view ? { view: this.acc.view, w: this.acc.w, h: this.acc.h } : null;
-    this.fadeStart = performance.now();
-    this.accCur = 1 - this.accCur;
-    this.resolve(job, 0, !complete || job.capped);
-    this.acc = { view: job.view, w: job.w, h: job.h, count: 1, complete: complete && !job.capped, N: job.N };
+  /** Copy a job into its layer of the stack, taking a slot for it the first time. */
+  private snapshot(job: Job, final: boolean, t: number): void {
+    let L = job.layer;
+    if (!L) {
+      L = { slot: this.freeSlot(job), view: job.view, w: job.w, h: job.h, N: job.N, Naa: job.N, tag: job.tag, complete: false, known: 0, born: t, seq: ++this.layerSeq };
+      this.layers.push(L);
+      job.layer = L;
+      // a picture of another formula or parameter waits out of sight, unless there is nothing else to show
+      if (!this.layers.some((x) => x.tag === this.showTag)) this.reveal(job);
+    }
+    this.resolve(job, this.stackTex, L.slot, final);
+    L.N = job.N;
+    job.dirty = false;
+    if (L.tag !== this.showTag && t - job.t0 > 250) this.reveal(job);
   }
 
-  private layerXform(now: View, lv: View): [number, number, number, number] | null {
-    const ratio = Math.pow(2, now.ls - lv.ls);
-    const [dx, dy] = offsetIn(lv, now);
-    if (!(ratio < 256 && ratio > 1 / 256) || !(Math.hypot(dx, dy) < 256)) return null;
-    return [ratio, dx, dy, this.W / this.H];
+  private freeSlot(job: Job): number {
+    if (this.layers.length >= MAXL) {
+      const out = this.evict(job);
+      this.layers = this.layers.filter((x) => x !== out);
+      if (this.aa.layer === out) this.aa = { layer: null, count: 0 };
+    }
+    for (let s = 0; s < MAXL; s++) if (!this.layers.some((x) => x.slot === s)) return s;
+    return 0;
   }
 
-  private display(now: View): void {
+  /** Octaves by which a layer's grain is coarser than the screen's at view `now`. */
+  private grain(L: Layer, now: View): number {
+    return L.view.ls - Math.log2(L.h) - (now.ls - Math.log2(this.H));
+  }
+
+  /** The stack is full: pick the layer that will be missed least. */
+  private evict(job: Job): Layer {
+    const now = this.lastView || job.view;
+    const info = this.layers.map((L) => ({ L, d: this.grain(L, now), seen: !!this.place(now, L) }));
+    // leftovers of another picture, layers off the screen, layers far too coarse or too fine to matter
+    let out: Layer | null = null;
+    let worst = 0;
+    for (const i of info) {
+      const s = i.L.tag !== this.showTag && i.L.tag !== job.tag ? 1e9 : !i.seen ? 1e6 : i.d > 6 ? i.d : i.d < -5 ? -i.d : 0;
+      if (s > worst) {
+        worst = s;
+        out = i.L;
+      }
+    }
+    if (out) return out;
+    // then the emptiest: a layer that knows next to nothing
+    for (const i of info) {
+      if (!i.L.complete && i.L !== job.layer && i.L.known < 0.05 && (!out || i.L.seq < out.seq)) out = i.L;
+    }
+    if (out) return out;
+    info.sort((a, b) => a.d - b.d || a.L.seq - b.L.seq);
+    // two of the same grain: the unfinished one, or else the older, is the spare
+    for (let i = 0; i + 1 < info.length; i++) {
+      if (info[i + 1].d - info[i].d < 0.08) return info[i].L.complete && !info[i + 1].L.complete ? info[i + 1].L : info[i].L;
+    }
+    // otherwise thin the ladder out where it is densest; its rungs lie closer together near the screen's own grain
+    const u = (d: number) => Math.sign(d) * Math.log(1 + Math.abs(d) / 0.5);
+    let k = 1;
+    let gap = Infinity;
+    for (let i = 1; i < info.length - 1; i++) {
+      // a finished picture is worth more than a rung's place: it goes only when nothing else can
+      const g = u(info[i + 1].d) - u(info[i - 1].d) + (info[i].L.complete ? 100 : 0);
+      if (g < gap) {
+        gap = g;
+        k = i;
+      }
+    }
+    return info[k].L;
+  }
+
+  /** A finished layer has no gaps: whatever it covers at no finer a grain is of no more use. */
+  private prune(L: Layer): void {
+    const a = this.W / this.H;
+    const g = L.view.ls - Math.log2(L.h);
+    this.layers = this.layers.filter((M) => {
+      if (M === L || M.tag !== L.tag) return true;
+      if (M.view.ls - Math.log2(M.h) < g - 0.01) return true; // finer: still the better picture of its part
+      const r = Math.pow(2, M.view.ls - L.view.ls);
+      if (!(r < 256)) return true;
+      const [dx, dy] = offsetIn(L.view, M.view);
+      return !(Math.abs(dx) + r * a <= a * 1.0005 && Math.abs(dy) + r <= 1.0005);
+    });
+    if (this.aa.layer && !this.layers.includes(this.aa.layer)) this.aa = { layer: null, count: 0 };
+  }
+
+  /** Where a layer lies on a screen showing `now` (null: nowhere), and whether it covers all of it. */
+  private place(now: View, L: Layer): { ratio: number; dx: number; dy: number; full: boolean } | null {
+    const ratio = Math.pow(2, now.ls - L.view.ls);
+    if (!(ratio < 256 && ratio > 1 / 256)) return null;
+    const [dx, dy] = offsetIn(L.view, now);
+    const a = this.W / this.H;
+    if (!(Math.abs(dx) < a * (1 + ratio) && Math.abs(dy) < 1 + ratio)) return null;
+    return { ratio, dx, dy, full: Math.abs(dx) + ratio * a <= a * 1.0005 && Math.abs(dy) + ratio <= 1.0005 };
+  }
+
+  private display(now: View, t: number): void {
     const gl = this.gl;
     const { p, u } = this.prog.display;
-    const job = this.job;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.W, this.H);
     gl.useProgram(p);
 
-    const acc = this.acc;
-    const ax = acc.count && acc.view ? this.layerXform(now, acc.view) : null;
-    this.bindTex(0, gl.TEXTURE_2D_ARRAY, this.accTexs[this.accCur]);
-    gl.uniform1i(u.uAcc, 0);
-    gl.uniform1i(u.uAccCount, ax ? acc.count : 0);
-    gl.uniform2f(u.uAccSize, acc.w || 1, acc.h || 1);
-    if (ax) gl.uniform4f(u.uAccX, ax[0], ax[1], ax[2], ax[3]);
-
-    const fade = Math.min(1, (performance.now() - this.fadeStart) / this.fadeMs);
-    const px = this.prev && fade < 1 ? this.layerXform(now, this.prev.view) : null;
-    this.bindTex(3, gl.TEXTURE_2D_ARRAY, this.accTexs[1 - this.accCur]);
-    gl.uniform1i(u.uPrev, 3);
-    gl.uniform1i(u.uPrevOn, px ? 1 : 0);
-    gl.uniform1f(u.uFade, fade * fade * (3 - 2 * fade));
-    if (px) {
-      gl.uniform2f(u.uPrevSize, this.prev!.w, this.prev!.h);
-      gl.uniform4f(u.uPrevX, px[0], px[1], px[2], px[3]);
+    // Best layer first: the finished picture of this very view, then whatever comes
+    // nearest the screen's grain (a little too fine is better than a little too coarse).
+    const list: { L: Layer; at: { ratio: number; dx: number; dy: number; full: boolean }; cost: number }[] = [];
+    for (const L of this.layers) {
+      if (L.tag !== this.showTag || (!L.complete && L.known < 0.02)) continue; // nothing to show yet
+      const at = this.place(now, L);
+      if (!at) continue;
+      const d = this.grain(L, now);
+      list.push({ L, at, cost: L === this.exact ? -1 : d >= 0 ? d : -0.4 * d });
     }
-
-    // Filling a moving picture in pixel by pixel reads as boiling noise, so the job
-    // in progress is only shown at rest (or when there is nothing else to show).
-    const showB = job && !job.aa && job.passes > 0 && (!job.motion || !ax);
-    const bx = showB ? this.layerXform(now, job!.view) : null;
-    this.bindTex(1, gl.TEXTURE_2D, bx ? this.targets[job!.front].s1 : this.dummyTex);
-    gl.uniform1i(u.uB, 1);
-    gl.uniform1i(u.uBOn, bx ? 1 : 0);
-    gl.uniform1i(u.uBCapped, job && job.capped ? 1 : 0);
-    if (bx) {
-      gl.uniform2f(u.uBSize, job!.w, job!.h);
-      gl.uniform4f(u.uBX, bx[0], bx[1], bx[2], bx[3]);
+    list.sort((x, y) => x.cost - y.cost || y.L.seq - x.L.seq);
+    // with every spot known the picture goes straight to the screen; otherwise by way of FILL
+    let direct = false;
+    for (let i = 0; i < list.length; i++) {
+      const { L, at } = list[i];
+      const f = Math.min(1, (t - L.born) / Math.max(1, this.fadeMs));
+      this.lx.set([at.ratio, at.dx, at.dy, L.slot], i * 4);
+      // a layer that ends within the screen ends softly, not as a rectangle
+      this.lsz.set([L.w, L.h, f * f * (3 - 2 * f), at.full ? 0 : Math.max(8, 0.03 * L.h)], i * 4);
+      // nothing shows through a finished layer that covers the screen
+      if (L.complete && at.full && f >= 1) {
+        list.length = i + 1;
+        direct = true;
+      }
     }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, direct ? null : this.compFbo);
+    this.bindTex(0, gl.TEXTURE_2D_ARRAY, this.stackTex);
+    gl.uniform1i(u.uStack, 0);
+    this.bindTex(1, gl.TEXTURE_2D_ARRAY, this.aaTex);
+    gl.uniform1i(u.uAA, 1);
+    gl.uniform1i(u.uCount, list.length);
+    this.stats.layers = list.length;
+    gl.uniform4fv(u.uLX, this.lx);
+    gl.uniform4fv(u.uLS, this.lsz);
+    gl.uniform1i(u.uAACount, list.length && list[0].L === this.exact && this.aa.layer === this.exact ? this.aa.count : 0);
+    gl.uniform1i(u.uDirect, direct ? 1 : 0);
     this.bindTex(2, gl.TEXTURE_2D, this.palTex);
     gl.uniform1i(u.uPal, 2);
     gl.uniform2f(u.uRes, this.W, this.H);
     gl.uniform1f(u.uAspect, this.W / this.H);
     gl.uniform1f(u.uPhase, this.phase);
     gl.uniform1f(u.uDensity, this.density);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (direct) return;
+    // fill what no layer knows from the colours around it (see FILL)
+    const n = this.pull.length;
+    const down = this.prog.down;
+    gl.useProgram(down.p);
+    gl.uniform1i(down.u.uSrc, 3);
+    for (let i = 0; i < n; i++) {
+      const d = this.pull[i];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, d.fbo);
+      gl.viewport(0, 0, d.w, d.h);
+      this.bindTex(3, gl.TEXTURE_2D, i ? this.pull[i - 1].tex : this.compTex);
+      gl.uniform2f(down.u.uSize, d.w, d.h);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    const up = this.prog.up;
+    gl.useProgram(up.p);
+    gl.uniform1i(up.u.uOwn, 3);
+    gl.uniform1i(up.u.uUp, 4);
+    for (let i = n - 1; i >= 0; i--) {
+      const d = this.push[i];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, d.fbo);
+      gl.viewport(0, 0, d.w, d.h);
+      this.bindTex(3, gl.TEXTURE_2D, this.pull[i].tex);
+      this.bindTex(4, gl.TEXTURE_2D, i < n - 1 ? this.push[i + 1].tex : this.dummyTex);
+      gl.uniform2f(up.u.uSize, d.w, d.h);
+      gl.uniform1i(up.u.uTop, i === n - 1 ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    const fill = this.prog.fill;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.W, this.H);
+    gl.useProgram(fill.p);
+    this.bindTex(3, gl.TEXTURE_2D, this.compTex);
+    this.bindTex(4, gl.TEXTURE_2D, n ? this.push[0].tex : this.dummyTex);
+    gl.uniform1i(fill.u.uC, 3);
+    gl.uniform1i(fill.u.uUp, 4);
+    gl.uniform2f(fill.u.uRes, this.W, this.H);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -690,8 +1398,9 @@ export class Renderer {
     const gl = this.gl;
     const out: number[] = [];
     const buf = new Float32Array(4);
+    const L = this.exact || this.layers[this.layers.length - 1];
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.accFbo);
-    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, this.accTexs[this.accCur], 0, 0);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, this.stackTex, 0, L ? L.slot : 0);
     for (const [x, y] of points) {
       gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, buf);
       out.push(buf[0]);

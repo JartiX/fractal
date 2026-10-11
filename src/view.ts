@@ -12,7 +12,7 @@ export interface View extends Point {
   ls: number; // log2 of the view half-height
 }
 
-export const LS_MAX = 1.5;
+export const LS_MAX = 2.5;
 export const LS_MIN = -9000;
 
 /** v * 2^e2 as fixed point with `prec` fractional bits. */

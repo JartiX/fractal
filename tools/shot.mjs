@@ -69,6 +69,7 @@ if (check > 0) {
   });
   const shift = res.pts.map((p, i) => Math.abs(res.gpu[i] - res.cpu[i]) / res.grad[i]).filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
   const mism = res.pts.filter((p, i) => (res.gpu[i] < 0) !== (res.cpu[i] < 0)).length;
+  if (!shift.length) shift.push(NaN);
   console.log(`shift px: n ${shift.length}, median ${shift[shift.length >> 1].toExponential(2)}, p90 ${shift[Math.floor(shift.length * 0.9)].toExponential(2)}, max ${shift[shift.length - 1].toExponential(2)}; inside/outside mismatches ${mism}`);
   errs.sort((a, b) => a - b);
   console.log(`check: ${check} px, bad ${bad}, median err ${errs[errs.length >> 1].toExponential(2)}, p90 ${errs[Math.floor(errs.length * 0.9)].toExponential(2)}, brute ${res.ms.toFixed(0)} ms`);
