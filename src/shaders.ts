@@ -712,10 +712,18 @@ void main() {
     ivec2 n = clamp(ivec2(floor(t + 0.5)), ivec2(0), hi);
     vec3 mean = vec3(0.0);
     if (l == 0 && uAACount > 0) {
-      // several samples of this very view: their plain average is the picture
+      // several samples of this very view: their plain average is the picture.
+      // (A sample that ran out of its own, lower limit says nothing and is left out.)
       mean = shade(texelFetch(uStack, ivec3(n, slot), 0).r);
-      for (int i = 0; i < uAACount; i++) mean += shade(texelFetch(uAA, ivec3(n, i), 0).r);
-      mean /= float(uAACount + 1);
+      float cnt = 1.0;
+      for (int i = 0; i < uAACount; i++) {
+        float v = texelFetch(uAA, ivec3(n, i), 0).r;
+        if (v > -1.5) {
+          mean += shade(v);
+          cnt += 1.0;
+        }
+      }
+      mean /= cnt;
       if (uAACount >= 3) {
         col += (1.0 - A) * a * mean;
         A += (1.0 - A) * a;

@@ -70,6 +70,7 @@ interface Job {
   wantN: number; // limit it would like but the reference is too short for
   lastActive: number; // fraction of pixels unfinished at the last probe
   lastBusy: number; // highest limit at which patches were still finishing
+  lateN: number; // how far pixels were seen to finish in earnest (what the next picture and the extra samples need)
   ec: number;
   sm: number;
   dm: [number, number];
@@ -176,6 +177,7 @@ export class Renderer {
   private layers: Layer[] = [];
   private layerSeq = 0;
   private showTag = -1; // which formula / parameter the layers on screen belong to
+  private holdUntil = 0; // after a change of fractal: leave the last frame on screen until then, or until there is a picture
   private exact: Layer | null = null; // the finished full-size picture of the view on screen
   private aa = { layer: null as Layer | null, count: 0 };
   private vel = { ls: 0, x: 0, y: 0 }; // how the view is moving, per millisecond
@@ -448,6 +450,7 @@ export class Renderer {
     this.aa = { layer: null, count: 0 };
     this.exact = null;
     this.showTag = -1;
+    this.holdUntil = performance.now() + 600;
     this.need = 0;
     this.resumeN = 0;
     this.needIter = 0;
@@ -728,7 +731,9 @@ export class Renderer {
     if (job.aa) {
       const a = this.aa;
       if (same && a.layer && a.layer === job.layer && a.count < this.maxSamples - 1) {
-        this.resolve(job, this.aaTex, a.count, true);
+        // at the picture's own limit an unfinished sample is inside like an unfinished pixel
+        // of the picture; at a lower one it says nothing (the display leaves it out)
+        this.resolve(job, this.aaTex, a.count, job.N >= a.layer.N);
         a.count++;
       }
       return;
@@ -739,11 +744,11 @@ export class Renderer {
     this.reveal(job);
     const L = job.layer!;
     L.complete = !job.motion;
-    L.known = L.complete ? 1 : 1 - job.lastActive;
-    // where the next picture starts: the last limit that was still needed
-    this.need = job.lastBusy > 0 ? job.lastBusy : Math.min(job.N, job.base) / 2;
+    L.known = L.complete ? 1 : Math.max(0.5, 1 - job.lastActive);
+    // where the next picture starts: as far as pixels were seen to finish
+    this.need = job.lateN > 0 ? job.lateN : job.N;
     this.needLs = job.view.ls;
-    // extra samples only smooth edges: the last busy limit serves them, and a
+    // extra samples only smooth edges: that limit serves them too, and a
     // picture that took long to finish gets fewer of them
     L.Naa = Math.max(1, Math.min(job.N, Math.ceil(this.need)));
     const ms = t - job.t0;
@@ -776,8 +781,10 @@ export class Renderer {
     this.resumeN = Math.max(this.resumeN, job.N, job.wantN);
     this.resumeBase = Math.max(job.lastBusy, job.base);
     const L = job.layer;
-    if (L && L.known < 0.02 && this.layers.some((x) => x !== L && x.tag === L.tag)) {
-      // it has learnt nothing: its layer would only take a place in the stack
+    const hidden = !!L && L.tag !== this.showTag;
+    if (L && (hidden ? L.known < 0.5 && this.layers.some((x) => x.tag === this.showTag) : L.known < 0.02 && this.layers.some((x) => x !== L && x.tag === L.tag))) {
+      // it has learnt nothing (or, not yet on screen, too little to replace what is):
+      // its layer would only take a place in the stack, or blank the picture
       this.layers = this.layers.filter((x) => x !== L);
       job.layer = null;
     }
@@ -802,6 +809,8 @@ export class Renderer {
       return;
     }
     const gl = this.gl;
+    // every pixel has had its iterations: this is a picture, whatever the last probe (a few frames old) says
+    if (job.layer) job.layer.known = Math.max(job.layer.known, 0.5);
     this.reveal(job); // show what there is while the question is open
     if (this.evq) gl.deleteSync(this.evq.sync);
     const t = this.targets[job.front];
@@ -829,9 +838,10 @@ export class Renderer {
 
   /**
    * The answer to limitReached: how many pixels finished late and how bunched they
-   * are; how many are still unknown, and the most of them in one block.
+   * are (in blocks finishing together, and in any block); how many are still
+   * unknown, and the most of them in one block.
    */
-  private decide(job: Job, total: number, densest: number, unknown: number, patch: number): void {
+  private decide(job: Job, total: number, densest: number, dense: number, unknown: number, patch: number): void {
     const ref: RefGpu | null = job.ref;
     const now = performance.now();
     // Patches still coming in, or simply a lot of pixels: the tail is not over.
@@ -844,6 +854,12 @@ export class Renderer {
       job.lastBusy = job.N;
       job.busyAt = now;
     }
+    // How far finishing was seen to go, whether or not it is worth going on for:
+    // the extra samples and the next picture must reach that far. The check looks
+    // at the upper half of the limit; a stretch below it that no check has looked
+    // at (the first limit, or a limit raised by a leap) counts as busy.
+    if (dense >= EV_PATCH || total >= job.w * job.h * 0.004) job.lateN = job.N;
+    else if (job.Nprev < job.N / 2) job.lateN = Math.max(job.lateN, job.N / 2);
     // A whole patch neither escaped nor proven inside. For an analytic formula that
     // is suspect - there the inside proves itself (the contraction test) - so more
     // likely the limit falls short of a later wave of escapes: look a good deal
@@ -949,6 +965,7 @@ export class Renderer {
       wantN: 0,
       lastActive: 1,
       lastBusy: 0,
+      lateN: 0,
       ec,
       sm: Math.pow(2, view.ls - ec),
       dm: off.dm,
@@ -1073,7 +1090,9 @@ export class Renderer {
     // is any pixel still running with iterations left under the limit?
     if (this.counts.length < 4) {
       const cq = gl.createQuery()!;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      // nothing is written, so any target as large as the job will do - but not the
+      // canvas: touching it would put an empty frame on screen when nothing else is drawn
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.compFbo);
       gl.colorMask(false, false, false, false);
       gl.useProgram(this.prog.count.p);
       this.bindTex(0, gl.TEXTURE_2D, dst.s1);
@@ -1155,6 +1174,7 @@ export class Renderer {
       gl.deleteSync(ev.sync);
       let total = 0;
       let densest = 0;
+      let dense = 0;
       let unknown = 0;
       let patch = 0;
       for (let i = 0; i < n; i += 4) {
@@ -1163,11 +1183,12 @@ export class Renderer {
         total += v;
         unknown += q;
         if (q > patch) patch = q;
+        if (v > dense) dense = v;
         // a patch coming in is a block whose late pixels finish close together;
         // dust sheds its pixels at any count whatever, round after round
         if (v > densest && this.evBuf[i + 3] - this.evBuf[i + 2] <= 0.15 * ev.job.N) densest = v;
       }
-      if (ev.job === this.job && ev.epoch === ev.job.epoch && ev.job.stage === 1) this.decide(ev.job, total, densest, unknown, patch);
+      if (ev.job === this.job && ev.epoch === ev.job.epoch && ev.job.stage === 1) this.decide(ev.job, total, densest, dense, unknown, patch);
     }
   }
 
@@ -1220,7 +1241,8 @@ export class Renderer {
     this.resolve(job, this.stackTex, L.slot, final);
     L.N = job.N;
     job.dirty = false;
-    if (L.tag !== this.showTag && t - job.t0 > 250) this.reveal(job);
+    // one of another parameter than what is shown takes its place once it has a good part to show
+    if (L.tag !== this.showTag && ((t - job.t0 > 250 && L.known >= 0.3) || t - job.t0 > 1500)) this.reveal(job);
   }
 
   private freeSlot(job: Job): number {
@@ -1321,6 +1343,9 @@ export class Renderer {
       list.push({ L, at, cost: L === this.exact ? -1 : d >= 0 ? d : -0.4 * d });
     }
     list.sort((x, y) => x.cost - y.cost || y.L.seq - x.L.seq);
+    // Just after a change of fractal there is nothing to draw yet. Drawing nothing at
+    // all leaves the last frame on screen, which beats a black flash between two pictures.
+    if (t < this.holdUntil && !list.some((x) => x.L.complete || x.L.known >= 0.3)) return;
     // with every spot known the picture goes straight to the screen; otherwise by way of FILL
     let direct = false;
     for (let i = 0; i < list.length; i++) {
