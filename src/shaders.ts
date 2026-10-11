@@ -58,7 +58,10 @@ uniform int uPerB; // likewise for the last segment
 uniform sampler2DArray uAccTex; // finished picture, for skipping what is certainly inside
 uniform int uSkipIn; // 1: an extra sample of a finished picture, 2: a picture overlapping an earlier one
 uniform int uAccLayer;
-uniform vec4 uSrcX; // where this job lies in that earlier picture: ratio, offset.xy
+uniform sampler2DArray uAaFrom; // extra samples of the picture before, when this one lies on its pixel grid
+uniform int uAaLayer; // which of them matches the sample being made (-1: none)
+uniform ivec2 uAaShift; // and by how many pixels that picture is shifted
+uniform vec4 uSrcX; // where this job lies in that earlier picture: ratio, offset.xy, and 1 if on its very grid
 uniform vec2 uSrcSize;
 uniform ivec2 uAccMax;
 uniform int uMaxIter;
@@ -225,6 +228,14 @@ float reuse() {
   vec2 p = gl_FragCoord.xy / uRes * 2.0 - 1.0;
   vec2 q = vec2(p.x * uAspect, p.y) * uSrcX.x + uSrcX.yz;
   vec2 t = (vec2(q.x / uAspect, q.y) * 0.5 + 0.5) * uSrcSize - 0.5;
+  if (uSrcX.w > 0.5) {
+    // the same grid moved by whole pixels (the view was only dragged): what the
+    // earlier picture has for a pixel is that pixel, smooth or not
+    ivec2 n = ivec2(floor(t + 0.5));
+    if (n.x < 0 || n.y < 0 || n.x >= int(uSrcSize.x) || n.y >= int(uSrcSize.y)) return -2.0;
+    float v = texelFetch(uAccTex, ivec3(n, uAccLayer), 0).r;
+    return v > -1.5 ? v : -2.0;
+  }
   vec2 b = floor(t);
   vec2 f = t - b;
   ivec2 c = ivec2(b);
@@ -283,7 +294,18 @@ void main() {
   float Ls = 0.0; // L at the last power-of-two iteration: a contraction has to go on to count
   if (uInit == 1) {
     if (uSkipIn != 0) {
-      float known = uSkipIn == 1 ? settled(px) : reuse();
+      float known = -2.0;
+      if (uSkipIn == 1) {
+        // the same sample of the picture this one was dragged from, if that had it
+        if (uAaLayer >= 0) {
+          ivec2 q = px + uAaShift;
+          if (q.x >= 0 && q.y >= 0 && q.x <= uAccMax.x && q.y <= uAccMax.y) {
+            float v = texelFetch(uAaFrom, ivec3(q, uAaLayer), 0).r;
+            if (v > -1.5) known = v;
+          }
+        }
+        if (known < -1.5) known = settled(px);
+      } else known = reuse();
       if (known > -1.5) {
         o0 = vec4(0.0);
         o1 = known == -1.0 ? vec4(0.0, 2.0, 0.0, 0.0) : known < 0.0 ? vec4(0.0, 3.0, 0.0, 0.0) : vec4(known, 1.0, 0.0, 0.0);
@@ -859,7 +881,10 @@ uniform int uPerB; // likewise for the last segment
 uniform sampler2DArray uAccTex; // finished picture, for skipping what is certainly inside
 uniform int uSkipIn; // 1: an extra sample of a finished picture, 2: a picture overlapping an earlier one
 uniform int uAccLayer;
-uniform vec4 uSrcX; // where this job lies in that earlier picture: ratio, offset.xy
+uniform sampler2DArray uAaFrom; // extra samples of the picture before, when this one lies on its pixel grid
+uniform int uAaLayer; // which of them matches the sample being made (-1: none)
+uniform ivec2 uAaShift; // and by how many pixels that picture is shifted
+uniform vec4 uSrcX; // where this job lies in that earlier picture: ratio, offset.xy, and 1 if on its very grid
 uniform vec2 uSrcSize;
 uniform ivec2 uAccMax;
 uniform vec2 uRes;
@@ -935,6 +960,14 @@ float reuse() {
   vec2 p = gl_FragCoord.xy / uRes * 2.0 - 1.0;
   vec2 q = vec2(p.x * uAspect, p.y) * uSrcX.x + uSrcX.yz;
   vec2 t = (vec2(q.x / uAspect, q.y) * 0.5 + 0.5) * uSrcSize - 0.5;
+  if (uSrcX.w > 0.5) {
+    // the same grid moved by whole pixels (the view was only dragged): what the
+    // earlier picture has for a pixel is that pixel, smooth or not
+    ivec2 n = ivec2(floor(t + 0.5));
+    if (n.x < 0 || n.y < 0 || n.x >= int(uSrcSize.x) || n.y >= int(uSrcSize.y)) return -2.0;
+    float v = texelFetch(uAccTex, ivec3(n, uAccLayer), 0).r;
+    return v > -1.5 ? v : -2.0;
+  }
   vec2 b = floor(t);
   vec2 f = t - b;
   ivec2 c = ivec2(b);
@@ -1020,7 +1053,18 @@ void main() {
   int e, m, it;
   if (uInit == 1) {
     if (uSkipIn != 0) {
-      float known = uSkipIn == 1 ? settled(px) : reuse();
+      float known = -2.0;
+      if (uSkipIn == 1) {
+        // the same sample of the picture this one was dragged from, if that had it
+        if (uAaLayer >= 0) {
+          ivec2 q = px + uAaShift;
+          if (q.x >= 0 && q.y >= 0 && q.x <= uAccMax.x && q.y <= uAccMax.y) {
+            float v = texelFetch(uAaFrom, ivec3(q, uAaLayer), 0).r;
+            if (v > -1.5) known = v;
+          }
+        }
+        if (known < -1.5) known = settled(px);
+      } else known = reuse();
       if (known > -1.5) {
         o0 = vec4(0.0);
         o1 = known == -1.0 ? vec4(0.0, 2.0, 0.0, 0.0) : known < 0.0 ? vec4(0.0, 3.0, 0.0, 0.0) : vec4(known, 1.0, 0.0, 0.0);

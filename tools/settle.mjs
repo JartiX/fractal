@@ -15,6 +15,7 @@ await page.goto(url);
 await page.waitForFunction('window.__fx');
 await page.evaluate(`document.body.classList.add('clean')`);
 await page.evaluate(() => { window.__fx.setCycling(false); });
+if (process.env.EVALJS) await page.evaluate(process.env.EVALJS);
 const all = await page.evaluate('__fx.formulas');
 const ids = which === 'all' ? all : which.split(',');
 let worst = 0;

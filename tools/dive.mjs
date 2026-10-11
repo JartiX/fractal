@@ -3,6 +3,8 @@
 //   node tools/dive.mjs <url> <formula> <bits> <secs> <speed> [outPrefix] [seed]
 // Starts at a boundary point pinned down to 2^-(bits+secs*speed+12), seen from 2^(8-bits).
 // speed < 0 zooms out instead (after first settling `secs*|speed|` octaves deeper).
+// With HERE=1 it starts from the view in the url's hash instead (formula and bits are then ignored).
+// With MANUAL=1 the view is zoomed directly, as by hand, instead of by the dive (which paces itself).
 //   mad    mean absolute colour difference to the settled picture (0-255); floorMad is
 //          what a perfect picture of the last view sampled a fraction of a pixel aside scores
 //   sharp  gradient energy relative to the settled picture (1 = as crisp)
@@ -22,24 +24,28 @@ page.on('pageerror', (e) => console.log('[error]', e.message));
 await page.goto(url);
 await page.waitForFunction('window.__fx');
 await page.evaluate(`document.body.classList.add('clean')`);
-await page.evaluate((f) => window.__fx.setFormula(f), formula);
+const here = !!process.env.HERE;
+if (!here) await page.evaluate((f) => window.__fx.setFormula(f), formula);
 // one sample per pixel and still colours: the comparison is then about the motion alone
 await page.evaluate(() => { window.__fx.setCycling(false); window.__fx.renderer.maxSamples = 1; });
+if (process.env.EVALJS) await page.evaluate(process.env.EVALJS);
 await page.waitForFunction('window.__fx.idle()', { timeout: 60000 }).catch(() => {});
-const S = Number(seed);
-const rnd = (k) => (S * 0.6180339887 + k * 0.7548776662) % 1;
-const span = Number(secs) * Number(speed);
-const deep = Number(bits) + Math.abs(span) + 12;
-let ok = false;
-for (let i = 0; i < 20 && !ok; i++) {
-  ok = await page.evaluate((i, r, deep) => {
-    const fx = window.__fx;
-    const b = fx.randomBracket((r[0] + i * 0.37) % 1, (r[1] + i * 0.11) % 1, r[2], r[3]) || fx.findBracket();
-    return !!b && fx.gotoBoundary(b[0], b[1], b[2], b[3], deep);
-  }, i, [rnd(1), rnd(2), rnd(3), rnd(4)], deep);
+if (!here) {
+  const S = Number(seed);
+  const rnd = (k) => (S * 0.6180339887 + k * 0.7548776662) % 1;
+  const span = Number(secs) * Number(speed);
+  const deep = Number(bits) + Math.abs(span) + 12;
+  let ok = false;
+  for (let i = 0; i < 20 && !ok; i++) {
+    ok = await page.evaluate((i, r, deep) => {
+      const fx = window.__fx;
+      const b = fx.randomBracket((r[0] + i * 0.37) % 1, (r[1] + i * 0.11) % 1, r[2], r[3]) || fx.findBracket();
+      return !!b && fx.gotoBoundary(b[0], b[1], b[2], b[3], deep);
+    }, i, [rnd(1), rnd(2), rnd(3), rnd(4)], deep);
+  }
+  if (!ok) { console.log('no boundary found'); await browser.close(); process.exit(1); }
+  await page.evaluate((ls) => { window.__fx.view.ls = ls; }, 8 - Number(bits) - (span < 0 ? -span : 0));
 }
-if (!ok) { console.log('no boundary found'); await browser.close(); process.exit(1); }
-await page.evaluate((ls) => { window.__fx.view.ls = ls; }, 8 - Number(bits) - (span < 0 ? -span : 0));
 await page.waitForFunction('window.__fx.idle()', { timeout: 180000, polling: 100 }).catch(() => console.log('not idle at start'));
 
 // helpers living in the page
@@ -84,10 +90,10 @@ await page.evaluate(() => {
   };
 });
 
-const snaps = await page.evaluate(async (secs, speed) => {
+const snaps = await page.evaluate(async (secs, speed, manual) => {
   const fx = window.__fx;
   const d = fx.dive;
-  d.on = true; d.auto = false; d.target = null; d.lost = 0; d.speed = speed; d.rate = speed;
+  if (!manual) { d.on = true; d.auto = false; d.target = null; d.lost = 0; d.speed = speed; d.rate = speed; }
   window.__snaps = [];
   const log = [];
   const t0 = performance.now();
@@ -99,6 +105,7 @@ const snaps = await page.evaluate(async (secs, speed) => {
   await new Promise((done) => {
     const tick = (t) => {
       { const j = fx.renderer.job; const cur = j ? { id: j.id, p: j.passes, K: Math.round(j.K), N: j.N, st: j.stage, w: j.w, src: !!j.src, age: Math.round(t - j.t0) } : null; if (last > 0 && t - last > 15 && slow.length < 14) slow.push({ dt: Math.round(t - last), prev: window.__pj, cur, g: +fx.renderer.stats.gpuMs.toFixed(1) }); window.__pj = cur; }
+      if (manual && last > 0) fx.view.ls -= speed * Math.min(0.1, (t - last) / 1000);
       if (last > 0) { dts.push(t - last); rest.push(fx.renderer.stats.restMs); gpu.push(fx.renderer.stats.gpuMs); lay.push(fx.renderer.stats.layers); }
       if (last > 0) worst = Math.max(worst, t - last); last = t;
       const r = fx.renderer;
@@ -119,7 +126,7 @@ const snaps = await page.evaluate(async (secs, speed) => {
   dts.sort((a, b) => a - b);
   window.__pace = { frames: dts.length, p50: +dts[dts.length >> 1].toFixed(1), p95: +dts[Math.floor(dts.length * 0.95)].toFixed(1), max: +dts[dts.length - 1].toFixed(1), over25: dts.filter((x) => x > 25).length, over10: dts.filter((x) => x > 10).length, rest: +(rest.reduce((a, b) => a + b, 0) / rest.length).toFixed(2), restMax: +Math.max(...rest).toFixed(2), gpu: +(gpu.reduce((a, b) => a + b, 0) / gpu.length).toFixed(2), layers: +(lay.reduce((a, b) => a + b, 0) / lay.length).toFixed(2) };
   return log;
-}, Number(secs), Number(speed));
+}, Number(secs), Number(speed), !!process.env.MANUAL);
 
 const res = [];
 for (let i = 0; i < snaps.length; i++) {

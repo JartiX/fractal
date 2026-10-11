@@ -5,15 +5,15 @@
 
 import { Spec, makeBigStep, sx, sy } from './formulas';
 import { makeCustom, NEWTON } from './custom';
+import { BlaParams, BlaState, BlaLevel, blaRange, merge, emit, concat, LMIN, MAX_LEVELS, EPS_L2, ZERO_E } from './bla';
+import type { BlaJob, BlaJobResult } from './blaWorker';
+
+export { LMIN, MAX_LEVELS, EPS_L2 };
 
 export const R2 = 1.0e6; // bailout radius squared, must match the shader
 export const TEXW = 2048;
-export const LMIN = 2; // lowest BLA level kept (skips 2^LMIN iterations)
-export const MAX_LEVELS = 24;
 // above this float32 overflows near the bailout radius
 export const MAX_POWER = 10;
-const ZERO_E = -10000000;
-export const EPS_L2 = -16; // log2 of the BLA linearisation tolerance
 // two exact orbit points this close (in units of the last bit) are the same point of a cycle
 const CYCLE_TOL = 1n << 16n;
 
@@ -71,10 +71,17 @@ export interface RefResult extends BlaData {
   orbit: Float32Array;
   orbitRows: number;
   ms: number;
+  msOrbit?: number; // of which the orbit itself (the rest is the BLA table)
 }
 export interface BlaResult extends BlaData {
   type: 'bla';
   id: number;
+}
+
+/** Threads to build BLA tables on, each at the other end of a port (see blaWorker.ts). */
+export interface PoolMessage {
+  type: 'pool';
+  ports: MessagePort[];
 }
 
 /** The orbit could not be made: in practice, no memory for one this long. */
@@ -85,12 +92,13 @@ export interface FailResult {
 
 // --- float helpers -------------------------------------------------------
 
-const f64 = new Float64Array(1);
+// (in the middle of a buffer of its own, clear of other threads' data: see bla.ts)
+const f64 = new Float64Array(32);
 const u32 = new Uint32Array(f64.buffer);
 /** e such that x = m * 2^e with m in [0.5, 1) (x normal, non-zero). */
 function expOf(x: number): number {
-  f64[0] = x;
-  return ((u32[1] >>> 20) & 0x7ff) - 1022;
+  f64[16] = x;
+  return ((u32[33] >>> 20) & 0x7ff) - 1022;
 }
 const POFF = 1100;
 const POW2 = new Float64Array(2 * POFF + 1);
@@ -173,6 +181,21 @@ interface Orbit {
   zr: Float64Array;
   zi: Float64Array;
   ze: Int32Array;
+  /** Where the orbit stopped for want of room, so that a longer one of the same point can go on from there. */
+  resume: Resume | null;
+}
+interface Resume {
+  cx: bigint;
+  cy: bigint;
+  prec: number;
+  zx: bigint;
+  zy: bigint;
+  svx: bigint;
+  svy: bigint;
+  svfx: number;
+  svfy: number;
+  svn: number;
+  nextSave: number;
 }
 let cur: Orbit | null = null;
 let latestRef = 0;
@@ -186,6 +209,9 @@ async function computeRef(req: RefRequest): Promise<void> {
   const cap = req.maxIter + 1;
   const SH = BigInt(prec - 62);
   const INV = Math.pow(2, -62);
+  // while the number fits a double's range it converts in one go, without a shifted copy
+  const direct = prec <= 960;
+  const INVP = Math.pow(2, -prec);
   const step = makeBigStep(spec, prec);
   // Mandelbrot-like: one orbit, of the critical point 0 with c = the reference point.
   // Julia: the orbit of the reference point itself, then the critical orbit, which
@@ -199,6 +225,30 @@ async function computeRef(req: RefRequest): Promise<void> {
   const sre = signRe ? new Uint8Array(cap) : null;
   // folded formulas: each component again with its own exponent (see the shader's absStep)
   const comps = spec.kind === 'abs' ? new Float32Array(cap * segs.length * 4) : null;
+
+  // A longer orbit of the point the last one was made for (the picture ran past its
+  // end) goes on from where that one stopped: the first part is not iterated again.
+  const prev = cur;
+  const from =
+    prev && prev.resume && !spec.julia && spec.kind === 'power' && prev.spec.kind === 'power' && !prev.spec.julia && prev.power === power &&
+    prev.resume.cx === cx && prev.resume.cy === cy && prev.resume.prec === prec && cap > prev.M
+      ? prev
+      : null;
+  const start = from ? from.M - 1 : 0;
+  if (from) {
+    zr.set(from.zr.subarray(0, start));
+    zi.set(from.zi.subarray(0, start));
+    ze.set(from.ze.subarray(0, start));
+    for (let n = 0, o = 0; n < start; n++, o += 4) {
+      orbit[o] = zr[n];
+      orbit[o + 1] = zi[n];
+      if (ze[n] !== 0) {
+        orbit[o + 2] = ze[n];
+        orbit[o + 3] = 1;
+      }
+    }
+  }
+  let resume: Resume | null = null;
 
   let total = 0;
   let lenA = 0;
@@ -220,9 +270,28 @@ async function computeRef(req: RefRequest): Promise<void> {
     let svn = 0;
     let nextSave = 1;
     let per = 0;
-    for (let n = 0; n < cap; n++) {
-      let x = Number(zx >> SH) * INV;
-      let y = Number(zy >> SH) * INV;
+    // z as doubles, and the saved point likewise: they tell two points apart long
+    // before the exact numbers need comparing
+    let fzx = direct ? Number(zx) * INVP : Number(zx >> SH) * INV;
+    let fzy = direct ? Number(zy) * INVP : Number(zy >> SH) * INV;
+    let svfx = fzx;
+    let svfy = fzy;
+    if (from) {
+      const r = from.resume!;
+      zx = r.zx;
+      zy = r.zy;
+      svx = r.svx;
+      svy = r.svy;
+      svfx = r.svfx;
+      svfy = r.svfy;
+      svn = r.svn;
+      nextSave = r.nextSave;
+      fzx = direct ? Number(zx) * INVP : Number(zx >> SH) * INV;
+      fzy = direct ? Number(zy) * INVP : Number(zy >> SH) * INV;
+    }
+    for (let n = start; n < cap; n++) {
+      let x = fzx;
+      let y = fzy;
       const o = (total + n) * 4;
       if (comps) {
         comp(zx, x, prec);
@@ -275,13 +344,21 @@ async function computeRef(req: RefRequest): Promise<void> {
       step(zx, zy, kx, ky);
       zx = sx;
       zy = sy;
+      fzx = direct ? Number(zx) * INVP : Number(zx >> SH) * INV;
+      fzy = direct ? Number(zy) * INVP : Number(zy >> SH) * INV;
       {
-        const ddx = zx - svx;
-        const ddy = zy - svy;
-        if ((ddx < 0n ? -ddx : ddx) < CYCLE_TOL && (ddy < 0n ? -ddy : ddy) < CYCLE_TOL) per = n + 1 - svn; // one more entry, then stop
+        let hit = false;
+        if (Math.abs(fzx - svfx) <= 1e-12 * (1 + Math.abs(fzx)) && Math.abs(fzy - svfy) <= 1e-12 * (1 + Math.abs(fzy))) {
+          const ddx = zx - svx;
+          const ddy = zy - svy;
+          hit = (ddx < 0n ? -ddx : ddx) < CYCLE_TOL && (ddy < 0n ? -ddy : ddy) < CYCLE_TOL;
+        }
+        if (hit) per = n + 1 - svn; // one more entry, then stop
         else if (n + 1 === nextSave) {
           svx = zx;
           svy = zy;
+          svfx = fzx;
+          svfy = fzy;
           svn = n + 1;
           nextSave *= 2;
         }
@@ -299,6 +376,8 @@ async function computeRef(req: RefRequest): Promise<void> {
     }
     perB = per;
     if (!esc && !per) capIter = Math.min(capIter, len - 1);
+    // stopped for want of room, on the last entry made: a longer orbit can take it from here
+    if (!esc && !per && segs.length === 1 && spec.kind === 'power') resume = { cx, cy, prec, zx, zy, svx, svy, svfx, svfy, svn, nextSave };
     total += len;
   }
   // attracting, not just periodic: the product of the derivatives round the cycle is below 1
@@ -309,9 +388,11 @@ async function computeRef(req: RefRequest): Promise<void> {
     interior = lg < -0.01;
   }
 
-  cur = { id: req.id, power, spec, sre, M: lenA, zr, zi, ze };
+  cur = { id: req.id, power, spec, sre, M: lenA, zr, zi, ze, resume };
+  const msOrbit = performance.now() - t0;
   // a Julia pixel has no dc term, so the table never has to allow for one
-  const bla = buildAny(cur, spec.julia ? -Infinity : req.lcmax);
+  const bla = await buildAny(cur, spec.julia ? -Infinity : req.lcmax);
+  if (req.id !== latestRef) return;
   if (spec.julia) bla.lcmax = Infinity;
   let packed: Float32Array;
   let orbitRows: number;
@@ -348,6 +429,7 @@ async function computeRef(req: RefRequest): Promise<void> {
     orbit: packed,
     orbitRows,
     ms: performance.now() - t0,
+    msOrbit,
     ...bla,
   };
   const transfer: Transferable[] = [packed.buffer];
@@ -502,7 +584,42 @@ async function computeCustom(req: RefRequest): Promise<void> {
 //   d' = A*d + B*dc      valid while |d| < r
 // Level 0 is a single iteration (A = p*Z^(p-1), B = 1, r ~ eps*|Z|); each higher
 // level merges two neighbours. A, B are float-exp, r is kept as log2.
-function buildBla(o: Orbit, lcmax: number): BlaData {
+// --- BLA tables, on several threads when the orbit is long --------------------------
+
+// The threads are made by the page and handed over as message ports (see main.ts): a
+// worker cannot always start workers of its own - not from inside the desktop app.
+let pool: MessagePort[] | null = null;
+let jobSeq = 0;
+const waiting = new Map<number, { done: (r: BlaJobResult) => void; fail: () => void }>();
+
+function setPool(ports: MessagePort[]): void {
+  pool = ports;
+  for (const port of ports) {
+    port.onmessage = (ev: MessageEvent<BlaJobResult>) => {
+      const p = waiting.get(ev.data.id);
+      waiting.delete(ev.data.id);
+      if (p) p.done(ev.data);
+    };
+    // a small table to begin with, so that the thread is loaded and warm when a real one comes
+    const n = 4096;
+    const job: BlaJob = { id: ++jobSeq, P: { kind: 'power', pw: 2, absRe: false, imMode: 0, imSign: 1, lcmax: -40 }, zr: new Float64Array(n).fill(0.7), zi: new Float64Array(n).fill(0.3), ze: new Int32Array(n), sre: null, n, upTo: 10 };
+    port.postMessage(job);
+  }
+}
+
+/** The threads have not answered in time: do without them from now on. */
+function dropPool(): void {
+  pool = null;
+  for (const p of waiting.values()) p.fail();
+  waiting.clear();
+}
+
+function params(o: Orbit, lcmax: number): BlaParams {
+  const s = o.spec;
+  return { kind: s.kind === 'abs' ? 'abs' : 'power', pw: o.power, absRe: s.absRe, imMode: s.imMode, imSign: s.imSign, lcmax };
+}
+
+async function buildAny(o: Orbit, lcmax: number): Promise<BlaData> {
   const blaOff = new Int32Array(MAX_LEVELS);
   const blaCnt = new Int32Array(MAX_LEVELS);
   const none: BlaData = { blaA: null, blaB: null, blaE: null, blaRows: 0, blaOff, blaCnt, blaLevels: 0, lcmax, lrMax: -1e30 };
@@ -519,308 +636,111 @@ function buildBla(o: Orbit, lcmax: number): BlaData {
     total += sizes[k];
   }
   const rows = Math.ceil(total / TEXW);
+  const P = params(o, lcmax);
+  const real = P.kind === 'abs';
   const outA = new Float32Array(rows * TEXW * 4);
+  const outB = real ? new Float32Array(rows * TEXW * 4) : null;
   const outE = new Float32Array(rows * TEXW * 4);
-
-  const { zr, zi, ze } = o;
-  const pw = o.power;
-  const lpw = Math.log2(pw);
-  const lrk = Math.log2(Math.min(1, 2 / (pw - 1))); // the neglected term grows with the power
   let lrMax = -1e30;
-  let n = n0;
-  let ax = new Float64Array(n);
-  let ay = new Float64Array(n);
-  let bx = new Float64Array(n);
-  let by = new Float64Array(n);
-  let ae = new Int32Array(n);
-  let be = new Int32Array(n);
-  let la = new Float64Array(n);
-  let lb = new Float64Array(n);
-  let lr = new Float64Array(n);
-  for (let j = 0; j < n; j++) {
-    const m = j + 1;
-    normz(zr[m], zi[m], ze[m]);
-    const zx = nx;
-    const zy = ny;
-    const lz = nx === 0 && ny === 0 ? -Infinity : ne + Math.log2(Math.hypot(nx, ny));
-    // A = p * Z^(p-1)
-    const zeN = ne;
-    for (let i = 2; i < pw; i++) normz(nx * zx - ny * zy, nx * zy + ny * zx, ne === ZERO_E ? ZERO_E : ne + zeN);
-    normz(nx * pw, ny * pw, ne);
-    ax[j] = nx;
-    ay[j] = ny;
-    ae[j] = ne;
-    bx[j] = 0.5;
-    be[j] = 1;
-    la[j] = lpw + (pw - 1) * lz;
-    lr[j] = EPS_L2 + lz + lrk;
-  }
-
-  for (let k = 1; k <= top; k++) {
-    const nk = sizes[k];
-    const cax = new Float64Array(nk);
-    const cay = new Float64Array(nk);
-    const cbx = new Float64Array(nk);
-    const cby = new Float64Array(nk);
-    const cae = new Int32Array(nk);
-    const cbe = new Int32Array(nk);
-    const cla = new Float64Array(nk);
-    const clb = new Float64Array(nk);
-    const clr = new Float64Array(nk);
-    for (let j = 0; j < nk; j++) {
-      const x = 2 * j;
-      const y = x + 1;
-      // A = Ay * Ax
-      normz(ay_re(ax, ay, x, y), ay_im(ax, ay, x, y), ae[x] + ae[y]);
-      cax[j] = nx;
-      cay[j] = ny;
-      cae[j] = ne;
-      cla[j] = la[x] + la[y];
-      // B = Ay * Bx + By
-      const tx = ax[y] * bx[x] - ay[y] * by[x];
-      const ty = ax[y] * by[x] + ay[y] * bx[x];
-      const te = ae[y] + be[x];
-      const en = te > be[y] ? te : be[y];
-      const st = pow2(te - en);
-      const sb = pow2(be[y] - en);
-      normz(tx * st + bx[y] * sb, ty * st + by[y] * sb, en);
-      cbx[j] = nx;
-      cby[j] = ny;
-      cbe[j] = ne;
-      clb[j] = nx === 0 && ny === 0 ? -Infinity : ne + Math.log2(Math.hypot(nx, ny));
-      // r = min(rx, (ry - |Bx|*cmax) / |Ax|)
-      const t = lb[x] + lcmax;
-      const ry = lr[y] > t ? lr[y] + Math.log2(1 - Math.pow(2, t - lr[y])) : -Infinity;
-      const r2 = ry - la[x];
-      clr[j] = lr[x] < r2 ? lr[x] : r2;
+  // a stretch's levels go where they belong: entry (first step >> k) of level k
+  const place = (levels: BlaLevel[], first: number): void => {
+    for (const l of levels) {
+      if (l.k > top) continue;
+      const at = (blaOff[l.k - LMIN] + (first >> l.k)) * 4;
+      outA.set(l.A, at);
+      if (outB && l.B) outB.set(l.B, at);
+      outE.set(l.E, at);
     }
-    ax = cax;
-    ay = cay;
-    bx = cbx;
-    by = cby;
-    ae = cae;
-    be = cbe;
-    la = cla;
-    lb = clb;
-    lr = clr;
-    if (k >= LMIN) {
-      let p = blaOff[k - LMIN] * 4;
-      for (let j = 0; j < nk; j++, p += 4) {
-        outA[p] = ax[j];
-        outA[p + 1] = ay[j];
-        outA[p + 2] = bx[j];
-        outA[p + 3] = by[j];
-        outE[p] = ae[j];
-        outE[p + 1] = be[j];
-        const r = lr[j];
-        outE[p + 2] = r > -1e30 ? r : -1e30;
-        if (r > lrMax) lrMax = r;
-      }
-    }
-  }
-  return { blaA: outA, blaB: null, blaE: outE, blaRows: rows, blaOff, blaCnt, blaLevels: top - LMIN + 1, lcmax, lrMax };
-}
-
-function buildAny(o: Orbit, lcmax: number): BlaData {
-  return o.spec.kind === 'abs' ? buildBlaReal(o, lcmax) : buildBla(o, lcmax);
-}
-
-// 2x2 real matrices with a shared exponent, four mantissas at index 4*i
-let me = 0; // exponent register of norm4
-function norm4(a: Float64Array, i: number, e: number): void {
-  const p = 4 * i;
-  let m = Math.abs(a[p]);
-  for (let k = 1; k < 4; k++) if (Math.abs(a[p + k]) > m) m = Math.abs(a[p + k]);
-  if (m === 0) {
-    me = ZERO_E;
-    return;
-  }
-  const k = expOf(m);
-  const s = pow2(-k);
-  a[p] *= s;
-  a[p + 1] *= s;
-  a[p + 2] *= s;
-  a[p + 3] *= s;
-  me = e + k;
-}
-function frob(a: Float64Array, i: number): number {
-  const p = 4 * i;
-  return Math.sqrt(a[p] * a[p] + a[p + 1] * a[p + 1] + a[p + 2] * a[p + 2] + a[p + 3] * a[p + 3]);
-}
-
-// BLA for the folded quadratics. Between folds the map is an ordinary quadratic,
-// so one step is d' = J d + dc with J the Jacobian at Z - a real 2x2 matrix, since
-// the folds break complex linearity. It holds while d is small against |Z| (the
-// d^2 term) and smaller than the distance to the nearest fold line (no sign flips).
-function buildBlaReal(o: Orbit, lcmax: number): BlaData {
-  const blaOff = new Int32Array(MAX_LEVELS);
-  const blaCnt = new Int32Array(MAX_LEVELS);
-  const none: BlaData = { blaA: null, blaB: null, blaE: null, blaRows: 0, blaOff, blaCnt, blaLevels: 0, lcmax, lrMax: -1e30 };
-  const n0 = o.M - 2;
-  if (n0 < 1 << (LMIN + 1)) return none;
-  const sizes: number[] = [n0];
-  while (sizes[sizes.length - 1] >> 1 >= 1) sizes.push(sizes[sizes.length - 1] >> 1);
-  const top = Math.min(sizes.length - 1, LMIN + MAX_LEVELS - 1);
-  let total = 0;
-  for (let k = LMIN; k <= top; k++) {
-    blaOff[k - LMIN] = total;
-    blaCnt[k - LMIN] = sizes[k];
-    total += sizes[k];
-  }
-  const rows = Math.ceil(total / TEXW);
-  const outA = new Float32Array(rows * TEXW * 4);
-  const outB = new Float32Array(rows * TEXW * 4);
-  const outE = new Float32Array(rows * TEXW * 4);
-
+  };
+  // entry j of level 0 is the step at reference index j + 1
   const { zr, zi, ze, sre } = o;
-  const { absRe, imMode, imSign } = o.spec;
-  let lrMax = -1e30;
-  let n = n0;
-  let A = new Float64Array(4 * n);
-  let B = new Float64Array(4 * n);
-  let ae = new Int32Array(n);
-  let be = new Int32Array(n);
-  let la = new Float64Array(n);
-  let lb = new Float64Array(n);
-  let lr = new Float64Array(n);
-  for (let j = 0; j < n; j++) {
-    const m = j + 1;
-    const p = 4 * j;
-    B[p] = 0.5;
-    B[p + 3] = 0.5;
-    be[j] = 1;
-    lb[j] = 0.5; // log2 of the Frobenius norm of the identity
-    if (ze[m] !== 0) {
-      // Z too small to be a plain float: the pixel restarts from the origin here anyway
-      ae[j] = ZERO_E;
-      la[j] = -Infinity;
-      lr[j] = -Infinity;
-      continue;
-    }
-    const X = zr[m];
-    const Y = zi[m];
-    const s1 = absRe && sre![m] ? -1 : 1;
-    A[p] = s1 * 2 * X;
-    A[p + 1] = -s1 * 2 * Y;
-    let g0: number;
-    let g1: number;
-    let fold = Infinity;
-    if (imMode === 0) {
-      g0 = Y;
-      g1 = X;
-    } else if (imMode === 1) {
-      const sg = X * Y < 0 ? -1 : 1;
-      g0 = sg * Y;
-      g1 = sg * X;
-      fold = Math.min(Math.abs(X), Math.abs(Y));
-    } else if (imMode === 2) {
-      g0 = X < 0 ? -Y : Y;
-      g1 = Math.abs(X);
-      fold = Math.abs(X);
-    } else {
-      g0 = Math.abs(Y);
-      g1 = Y < 0 ? -X : X;
-      fold = Math.abs(Y);
-    }
-    if (absRe) fold = Math.min(fold, Math.abs(Math.abs(X) - Math.abs(Y)) * Math.SQRT1_2);
-    A[p + 2] = 2 * imSign * g0;
-    A[p + 3] = 2 * imSign * g1;
-    norm4(A, j, 0);
-    ae[j] = me;
-    la[j] = me === ZERO_E ? -Infinity : me + Math.log2(frob(A, j));
-    lr[j] = Math.min(EPS_L2 + Math.log2(Math.hypot(X, Y)), Math.log2(fold) - 1);
-  }
-
-  for (let k = 1; k <= top; k++) {
-    const nk = sizes[k];
-    const cA = new Float64Array(4 * nk);
-    const cB = new Float64Array(4 * nk);
-    const cae = new Int32Array(nk);
-    const cbe = new Int32Array(nk);
-    const cla = new Float64Array(nk);
-    const clb = new Float64Array(nk);
-    const clr = new Float64Array(nk);
-    for (let j = 0; j < nk; j++) {
-      const x = 8 * j; // first of the pair, at 4*(2j)
-      const y = x + 4;
-      const q = 4 * j;
-      const ix = 2 * j;
-      const iy = ix + 1;
-      // A = Ay * Ax
-      cA[q] = A[y] * A[x] + A[y + 1] * A[x + 2];
-      cA[q + 1] = A[y] * A[x + 1] + A[y + 1] * A[x + 3];
-      cA[q + 2] = A[y + 2] * A[x] + A[y + 3] * A[x + 2];
-      cA[q + 3] = A[y + 2] * A[x + 1] + A[y + 3] * A[x + 3];
-      norm4(cA, j, ae[ix] + ae[iy]);
-      cae[j] = me;
-      cla[j] = me === ZERO_E ? -Infinity : me + Math.log2(frob(cA, j));
-      // B = Ay * Bx + By
-      const te = ae[iy] + be[ix];
-      const en = te > be[iy] ? te : be[iy];
-      const st = pow2(te - en);
-      const sb = pow2(be[iy] - en);
-      cB[q] = (A[y] * B[x] + A[y + 1] * B[x + 2]) * st + B[y] * sb;
-      cB[q + 1] = (A[y] * B[x + 1] + A[y + 1] * B[x + 3]) * st + B[y + 1] * sb;
-      cB[q + 2] = (A[y + 2] * B[x] + A[y + 3] * B[x + 2]) * st + B[y + 2] * sb;
-      cB[q + 3] = (A[y + 2] * B[x + 1] + A[y + 3] * B[x + 3]) * st + B[y + 3] * sb;
-      norm4(cB, j, en);
-      cbe[j] = me;
-      clb[j] = me === ZERO_E ? -Infinity : me + Math.log2(frob(cB, j));
-      // r = min(rx, (ry - |Bx| cmax) / |Ax|), with norms that can only overestimate
-      const t = lb[ix] + lcmax;
-      const ry = lr[iy] > t ? lr[iy] + Math.log2(1 - Math.pow(2, t - lr[iy])) : -Infinity;
-      const r2 = ry - la[ix];
-      clr[j] = lr[ix] < r2 ? lr[ix] : r2;
-    }
-    A = cA;
-    B = cB;
-    ae = cae;
-    be = cbe;
-    la = cla;
-    lb = clb;
-    lr = clr;
-    if (k >= LMIN) {
-      let p = blaOff[k - LMIN] * 4;
-      for (let j = 0; j < nk; j++, p += 4) {
-        const q = 4 * j;
-        outA[p] = A[q];
-        outA[p + 1] = A[q + 1];
-        outA[p + 2] = A[q + 2];
-        outA[p + 3] = A[q + 3];
-        outB[p] = B[q];
-        outB[p + 1] = B[q + 1];
-        outB[p + 2] = B[q + 2];
-        outB[p + 3] = B[q + 3];
-        outE[p] = ae[j];
-        outE[p + 1] = be[j];
-        const r = lr[j];
-        outE[p + 2] = r > -1e30 ? r : -1e30;
-        if (r > lrMax) lrMax = r;
+  const workers = n0 >= 200000 ? pool : null;
+  let done = false;
+  if (workers) {
+    // stretches of 2^C steps, several to a thread so that none waits long for the slowest
+    const C = Math.max(LMIN, Math.min(17, top, Math.floor(Math.log2(n0 / (8 * workers.length)))));
+    const size = 1 << C;
+    const count = Math.ceil(n0 / size);
+    try {
+      const results = await new Promise<BlaJobResult[]>((resolve, reject) => {
+        const res: BlaJobResult[] = new Array(count);
+        let next = 0;
+        let left = count;
+        const feed = (w: MessagePort): void => {
+          if (next >= count) return;
+          const c = next++;
+          const first = c * size;
+          const n = Math.min(size, n0 - first);
+          const job: BlaJob = {
+            id: ++jobSeq,
+            P,
+            zr: zr.slice(first + 1, first + 1 + n),
+            zi: zi.slice(first + 1, first + 1 + n),
+            ze: ze.slice(first + 1, first + 1 + n),
+            sre: sre ? sre.slice(first + 1, first + 1 + n) : null,
+            n,
+            upTo: C,
+          };
+          waiting.set(job.id, {
+            done: (r) => {
+              res[c] = r;
+              if (--left === 0) resolve(res);
+              else feed(w);
+            },
+            fail: () => reject(new Error('table thread failed')),
+          });
+          const transfer: Transferable[] = [job.zr.buffer, job.zi.buffer, job.ze.buffer];
+          if (job.sre) transfer.push(job.sre.buffer);
+          w.postMessage(job, transfer);
+        };
+        for (const w of workers) feed(w);
+        // a thread that died says nothing: do not wait for it for ever
+        setTimeout(() => {
+          if (left > 0) dropPool();
+        }, 15000 + n0 / 400);
+      });
+      const tops: BlaState[] = [];
+      results.forEach((r, c) => {
+        place(r.levels, c * size);
+        tops.push(r.top);
+        if (r.lrMax > lrMax) lrMax = r.lrMax;
+      });
+      // the few levels above the stretches, from their tops
+      let st = concat(tops, real ? 4 : 2);
+      for (let k = C + 1; k <= top; k++) {
+        st = merge(P, st);
+        const e = emit(P, k, st);
+        place([e.level], 0);
+        if (e.lrMax > lrMax) lrMax = e.lrMax;
       }
+      done = true;
+    } catch {
+      lrMax = -1e30; // fall through and build it all here
     }
+  }
+  if (!done) {
+    const r = blaRange(P, zr.subarray(1, n0 + 1), zi.subarray(1, n0 + 1), ze.subarray(1, n0 + 1), sre ? sre.subarray(1, n0 + 1) : null, n0, top);
+    place(r.levels, 0);
+    lrMax = r.lrMax;
   }
   return { blaA: outA, blaB: outB, blaE: outE, blaRows: rows, blaOff, blaCnt, blaLevels: top - LMIN + 1, lcmax, lrMax };
 }
 
-function ay_re(ax: Float64Array, ay: Float64Array, x: number, y: number): number {
-  return ax[y] * ax[x] - ay[y] * ay[x];
-}
-function ay_im(ax: Float64Array, ay: Float64Array, x: number, y: number): number {
-  return ax[y] * ay[x] + ay[y] * ax[x];
-}
-
-self.onmessage = (ev: MessageEvent<RefRequest | BlaRequest>) => {
+self.onmessage = (ev: MessageEvent<RefRequest | BlaRequest | PoolMessage>) => {
   const msg = ev.data;
-  if (msg.type === 'ref') {
+  if (msg.type === 'pool') {
+    setPool(msg.ports);
+  } else if (msg.type === 'ref') {
     latestRef = msg.id;
     Promise.resolve()
       .then(() => (msg.spec.kind === 'custom' ? computeCustom(msg) : computeRef(msg)))
       .catch(() => (self as unknown as Worker).postMessage({ type: 'fail', id: msg.id }));
   } else if (cur && cur.id === msg.id) {
-    const bla = buildAny(cur, msg.lcmax);
-    const out: BlaResult = { type: 'bla', id: msg.id, ...bla };
-    const transfer: Transferable[] = bla.blaA ? [bla.blaA.buffer, bla.blaE!.buffer] : [];
-    if (bla.blaB) transfer.push(bla.blaB.buffer);
-    (self as unknown as Worker).postMessage(out, transfer);
+    void buildAny(cur, msg.lcmax).then((bla) => {
+      const out: BlaResult = { type: 'bla', id: msg.id, ...bla };
+      const transfer: Transferable[] = bla.blaA ? [bla.blaA.buffer, bla.blaE!.buffer] : [];
+      if (bla.blaB) transfer.push(bla.blaB.buffer);
+      (self as unknown as Worker).postMessage(out, transfer);
+    });
   }
 };

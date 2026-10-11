@@ -86,6 +86,10 @@ interface Job {
   layer: Layer | null; // where it is drawn (for extra samples: the picture they refine)
   dirty: boolean; // has moved on since its layer was last written
   src: Layer | null; // an earlier picture whose smooth parts it takes over instead of iterating
+  exact: boolean; // ...which lies on this picture's own pixel grid: all it knows is taken over
+  share: number; // share of its pixels that it has to work out itself (0: not known beforehand)
+  carry: number; // an extra sample: 1 if it starts from the same sample of the picture before
+  strict: boolean; // made to the resting tolerance
   busyAt: number; // when patches were last seen finishing
   roundAt: number; // when the limit was last raised
   quiet: boolean; // gone quiet: what is unfinished is drawn as inside, though the job looks a little further
@@ -111,9 +115,12 @@ interface Layer {
   h: number;
   N: number; // iteration limit it was taken to
   Naa: number; // limit that serves extra samples of it
+  cost: number; // ms it took to make, or would take to make anew
   tag: number;
   complete: boolean; // a finished picture: nothing in it is still unknown
   known: number; // share of its pixels that are known, roughly
+  done: boolean; // its job ran its course (whatever is unknown in it will stay so)
+  strict: boolean; // made to the resting tolerance throughout: fit to be copied into a resting picture
   born: number; // when it first came on screen (it fades in)
   seq: number;
 }
@@ -123,6 +130,14 @@ interface Half {
   fbo: WebGLFramebuffer;
   w: number;
   h: number;
+}
+
+/** The extra samples of the picture at rest: whose they are, how many, and where the first ones can be taken from. */
+interface Extra {
+  layer: Layer | null;
+  count: number;
+  /** samples of the picture this one was dragged from (in the other texture), shifted by whole pixels */
+  from: { count: number; kx: number; ky: number } | null;
 }
 
 interface Target {
@@ -157,15 +172,23 @@ export class Renderer {
 
   // tuning / state exposed for the HUD
   q = 1; // resolution factor used while the view is moving
+  /** The camera is driven by the program (a dive), not by hand: it can be paced by the pictures. */
+  auto = false;
+  /**
+   * How far the picture lags the camera: octaves by which the best layer that covers
+   * the whole screen is coarser than the screen (1: none covers it). A dive is slowed by it.
+   */
+  behind = 0;
   maxSamples = 8;
   targetMs = 8;
   phase = 0;
   density = 0.03;
   noBla = false; // diagnostics
+  noGrid = false; // diagnostics: never take a dragged view's pixels over from the picture before
   biasMotion = 1;
   biasStatic = -3;
   lastJob = { passes: 0, steps: 0, ms: 0, w: 0, complete: false, fracs: [] as number[] };
-  stats = { steps: 0, passes: 0, samples: 0, scale: 1, busy: false, bla: false, gpuMs: 0, restMs: 0, layers: 0, N: 0, deepening: false };
+  stats = { steps: 0, passes: 0, samples: 0, scale: 1, busy: false, bla: false, gpuMs: 0, restMs: 0, layers: 0, N: 0, deepening: false, held: 0 };
 
   private prog!: { iterate: Program; resolve: Program; count: Program; events: Program; probe: Program; display: Program; down: Program; up: Program; fill: Program };
   private iterPrograms = new Map<string, Program>();
@@ -173,13 +196,20 @@ export class Renderer {
   private vao!: WebGLVertexArrayObject;
   private targets: Target[] = [];
   private stackTex!: WebGLTexture; // the layers: one float per pixel each (see RESOLVE)
-  private aaTex!: WebGLTexture; // extra jittered samples of the finished picture at rest
+  // extra jittered samples of the finished picture at rest; the other one holds those of
+  // the picture it was dragged from, which lie on the same sub-pixel positions
+  private aaTexs: WebGLTexture[] = [];
+  private aaCur = 0;
   private layers: Layer[] = [];
   private layerSeq = 0;
   private showTag = -1; // which formula / parameter the layers on screen belong to
   private holdUntil = 0; // after a change of fractal: leave the last frame on screen until then, or until there is a picture
   private exact: Layer | null = null; // the finished full-size picture of the view on screen
-  private aa = { layer: null as Layer | null, count: 0 };
+  private aa: Extra = { layer: null, count: 0, from: null };
+  // steps a pass of an extra sample can take within the frame's time, as the sample before showed
+  // (apart for samples that start from an earlier picture's): each one is much like the last
+  private aaK: [number, number] = [0, 0];
+  private aaKFor: Layer | null = null;
   private vel = { ls: 0, x: 0, y: 0 }; // how the view is moving, per millisecond
   private lastView: View | null = null;
   private lastT = 0;
@@ -199,6 +229,7 @@ export class Renderer {
   private probeTex!: WebGLTexture;
   private pbo!: WebGLBuffer;
   private probePending: { sync: WebGLSync; job: Job } | null = null;
+  private passSyncs: { sync: WebGLSync; at: number }[] = []; // passes still on the GPU, as far as is known
   private probeBuf = new Float32Array(PROBE_W * PROBE_H * 4);
   private timerExt: any = null;
   private timers: { q: WebGLQuery; job: Job; first: boolean; K: number }[] = [];
@@ -395,10 +426,10 @@ export class Renderer {
       return t;
     };
     this.stackTex = arr(this.stackTex, MAXL);
-    this.aaTex = arr(this.aaTex, this.maxSamples - 1);
+    this.aaTexs = [arr(this.aaTexs[0], this.maxSamples - 1), arr(this.aaTexs[1], this.maxSamples - 1)];
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.layers = [];
-    this.aa = { layer: null, count: 0 };
+    this.aa = { layer: null, count: 0, from: null };
     this.exact = null;
     this.job = null;
   }
@@ -407,7 +438,7 @@ export class Renderer {
   baseBytes(): number {
     // iteration state (two pairs of RGBA32F), layers and extra samples (R32F), the
     // composed picture with its halvings (RGBA16F), the canvas itself
-    return this.W * this.H * (64 + 4 * MAXL + 4 * (this.maxSamples - 1) + 8 * (1 + 2 / 3) + 8);
+    return this.W * this.H * (64 + 4 * MAXL + 8 * (this.maxSamples - 1) + 8 * (1 + 2 / 3) + 8);
   }
 
   /** Name of the graphics card as the driver reports it ('' if hidden). */
@@ -425,12 +456,12 @@ export class Renderer {
         spec.kind === 'custom'
           ? this.compile(customSrc(spec.custom, customInfo(spec.custom)), [
               'uS0', 'uS1', 'uOrbit', 'uInit', 'uRefLen', 'uEndA', 'uBase', 'uMaxIter', 'uSteps', 'uEc', 'uPow', 'uUOff',
-              'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uCref', 'uLref', 'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uAccLayer', 'uSrcX', 'uSrcSize',
+              'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uCref', 'uLref', 'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uAccLayer', 'uSrcX', 'uSrcSize', 'uAaFrom', 'uAaLayer', 'uAaShift',
             ])
           : this.compile(iterateSrc(spec), [
               'uS0', 'uS1', 'uOrbit', 'uBlaA', 'uBlaE', 'uInit', 'uRefLen', 'uEndA', 'uBase', 'uMaxIter', 'uSteps', 'uEc',
               'uBlaLevels', 'uBlaOff', 'uBlaCnt', 'uRes', 'uJitter', 'uDm', 'uAspect', 'uSm', 'uBlaBias', 'uEps2', 'uPow',
-              'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uLP', 'uPH', 'uKp', 'uKe', 'uBlaB', 'uUOff', 'uAccLayer', 'uSrcX', 'uSrcSize',
+              'uPerA', 'uPerB', 'uAccTex', 'uSkipIn', 'uAccMax', 'uLP', 'uPH', 'uKp', 'uKe', 'uBlaB', 'uUOff', 'uAccLayer', 'uSrcX', 'uSrcSize', 'uAaFrom', 'uAaLayer', 'uAaShift',
             ]);
       this.iterPrograms.set(key, prog);
     }
@@ -447,7 +478,7 @@ export class Renderer {
     this.ref = null;
     this.job = null;
     this.layers = [];
-    this.aa = { layer: null, count: 0 };
+    this.aa = { layer: null, count: 0, from: null };
     this.exact = null;
     this.showTag = -1;
     this.holdUntil = performance.now() + 600;
@@ -614,6 +645,7 @@ export class Renderer {
     this.pollQueries();
     this.pollProbe();
     this.track(now, isStatic, t);
+    const rest = isStatic;
     const ref = this.ref;
     let job = this.job;
 
@@ -631,15 +663,35 @@ export class Renderer {
           // it waits for a longer orbit, but only the newest one is ever made longer
           this.drop(job);
           job = null;
-        } else if (!same && this.stale(job, now, isStatic)) {
+        } else if (!same && this.stale(job, now, rest)) {
           this.tuneScale(job, true);
           this.drop(job);
+          job = null;
+        } else if (this.enough(job)) {
+          this.early(job, t);
           job = null;
         }
       }
     }
-    if (!job && ref) job = this.startJob(now, isStatic, N, ref);
-    if (job && job.stage === 0) this.pass(job, job.ref);
+    if (!job && ref) job = this.startJob(now, rest, N, ref);
+    // A pass that runs over its frame is still on the GPU when the next frame comes round,
+    // and the next pass queues up behind it; a queue of them holds everything up for a
+    // good many frames. So none is added while two are known to be in hand. (Word that a
+    // pass is through arrives a frame late: one is "in hand" even when all is on time.)
+    {
+      const gl = this.gl;
+      this.passSyncs = this.passSyncs.filter((s) => {
+        if (gl.getSyncParameter(s.sync, gl.SYNC_STATUS) !== gl.SIGNALED && t - s.at < 250) return true;
+        gl.deleteSync(s.sync);
+        return false;
+      });
+      if (job && job.stage === 0) {
+        if (this.passSyncs.length < 2) {
+          this.pass(job, job.ref);
+          this.passSyncs.push({ sync: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)!, at: t });
+        } else this.stats.held++;
+      }
+    }
     if (!job && this.oldRefs.length) this.sweep();
     const ext = this.timerExt;
     const gl = this.gl;
@@ -672,7 +724,8 @@ export class Renderer {
     const dt = t - this.lastT;
     const v = this.vel;
     let ok = false;
-    if (lv && !isStatic && dt > 0 && dt < 250) {
+    // (a view that did not move since the last frame has no velocity: the next picture is aimed right at it)
+    if (lv && !isStatic && !sameView(lv, now) && dt > 0 && dt < 250) {
       const [dx, dy] = offsetIn(lv, now);
       const dl = now.ls - lv.ls;
       if (Math.abs(dl) < 1.5 && Math.hypot(dx, dy) < 1.5) {
@@ -723,7 +776,40 @@ export class Renderer {
     // how much of the smaller of the two, job and screen, lies within the other
     const span = (c: number, half: number, lim: number) => Math.max(0, Math.min(c + half, lim) - Math.max(c - half, -lim));
     const cover = (span(dx, r * a, a) * span(dy, r, 1)) / (4 * a * Math.min(1, r * r));
-    return job.motion ? d > 0.9 || d < -1.3 || cover < 0.5 : Math.abs(d) > 0.3 || cover < 0.8;
+    // (a resting picture caught by motion gives way at once, unless it is nearly done)
+    return job.motion ? d > 0.9 || d < -1.3 || cover < 0.5 : job.lastActive > 0.15 || Math.abs(d) > 0.3 || cover < 0.8;
+  }
+
+  /**
+   * While the view moves a picture need not wait for its stragglers. The pixels that
+   * take longest are few - a rim, a speck - yet a picture waiting for them is late for
+   * all the others, and what lies under them shows through anyway.
+   */
+  private enough(job: Job): boolean {
+    if (!job.motion || job.aa || job.stage !== 0 || job.passes < 3) return false;
+    const f = job.lastActive;
+    if (f <= 0.015) return true;
+    const h = job.fracs;
+    // Or the rest has stopped coming in: a quarter more work finished next to nothing.
+    // That only means something once the bulk has come in - at the start no pixel
+    // has had the iterations to finish, and nothing coming in is just that.
+    if (h.length >= 6 && f <= 0.5 * h[0]) {
+      for (let i = h.length - 4; i >= 0; i -= 2) {
+        if (h[i + 1] <= job.steps * 0.8) return h[i] - f < 0.004;
+      }
+    }
+    return false;
+  }
+
+  /** End a moving picture that has enough (see above): its layer stays as it is. */
+  private early(job: Job, t: number): void {
+    this.tuneScale(job, false);
+    const ms = t - job.t0;
+    this.leadMs = Math.max(40, Math.min(900, this.leadMs + (ms - this.leadMs) * 0.4));
+    this.resumeN = Math.max(this.resumeN, job.N);
+    this.resumeBase = Math.max(job.lastBusy, job.base);
+    if (job.layer) job.layer.done = true;
+    this.lastJob = { passes: job.passes, steps: job.steps, ms, w: job.w, complete: false, fracs: job.fracs };
   }
 
   /** A job has ended with nothing more to learn. */
@@ -733,7 +819,7 @@ export class Renderer {
       if (same && a.layer && a.layer === job.layer && a.count < this.maxSamples - 1) {
         // at the picture's own limit an unfinished sample is inside like an unfinished pixel
         // of the picture; at a lower one it says nothing (the display leaves it out)
-        this.resolve(job, this.aaTex, a.count, job.N >= a.layer.N);
+        this.resolve(job, this.aaTexs[this.aaCur], a.count, job.N >= a.layer.N);
         a.count++;
       }
       return;
@@ -744,7 +830,21 @@ export class Renderer {
     this.reveal(job);
     const L = job.layer!;
     L.complete = !job.motion;
+    const A = this.aa.layer;
+    if (L.complete && job.exact && A && A !== L && this.aa.count > 0 && A.tag === L.tag && A.w === L.w && A.h === L.h && A.view.ls === L.view.ls) {
+      // Dragged from the picture the extra samples were made for, and on its pixel grid:
+      // the same samples serve this one, shifted by whole pixels - only the strip that
+      // came into view has to be made.
+      const [dx, dy] = offsetIn(A.view, L.view);
+      const kx = Math.round((dx * L.h) / 2);
+      const ky = Math.round((dy * L.h) / 2);
+      if (Math.abs((dx * L.h) / 2 - kx) < 1e-6 && Math.abs((dy * L.h) / 2 - ky) < 1e-6 && Math.abs(kx) < L.w && Math.abs(ky) < L.h) {
+        this.aa = { layer: L, count: 0, from: { count: this.aa.count, kx, ky } };
+        this.aaCur = 1 - this.aaCur;
+      }
+    }
     L.known = L.complete ? 1 : Math.max(0.5, 1 - job.lastActive);
+    L.done = true;
     // where the next picture starts: as far as pixels were seen to finish
     this.need = job.lateN > 0 ? job.lateN : job.N;
     this.needLs = job.view.ls;
@@ -752,10 +852,49 @@ export class Renderer {
     // picture that took long to finish gets fewer of them
     L.Naa = Math.max(1, Math.min(job.N, Math.ceil(this.need)));
     const ms = t - job.t0;
-    this.aaTarget = ms > 5000 ? 2 : ms > 1500 ? Math.min(4, this.maxSamples) : this.maxSamples;
+    // (a picture mostly taken over was quick to put together, yet a sample of it is made in full)
+    L.cost = Math.max(L.cost, ms);
+    this.aaTarget = L.cost > 5000 ? 2 : L.cost > 1500 ? Math.min(4, this.maxSamples) : this.maxSamples;
     if (job.motion) this.leadMs = Math.max(40, Math.min(900, this.leadMs + (ms - this.leadMs) * 0.4));
     this.lastJob = { passes: job.passes, steps: job.steps, ms, w: job.w, complete: true, fracs: job.fracs };
     if (L.complete) this.prune(L);
+  }
+
+  /**
+   * The newest careful layer of the same scale and size as a picture of `view` would
+   * be, and overlapping it: that picture can lie on its pixel grid. `aligned` says
+   * `view` already does; `snapped` is the nearest view that does.
+   */
+  private grid(view: View, w: number, h: number, tag: number): { layer: Layer; aligned: boolean; snapped: View; dx: number; dy: number } | null {
+    if (this.noGrid) return null;
+    const a = this.W / this.H;
+    let best: Layer | null = null;
+    for (const L of this.layers) {
+      if (!L.strict || L.tag !== tag || L.tag !== this.showTag || L.w !== w || L.h !== h || L.view.ls !== view.ls) continue;
+      const [dx, dy] = offsetIn(L.view, view);
+      if (Math.abs(dx) > 1.6 * a || Math.abs(dy) > 1.6) continue; // a fifth of it still in view, at least
+      if (!best || L.seq > best.seq) best = L;
+    }
+    if (!best) return null;
+    const [dx, dy] = offsetIn(best.view, view);
+    const kx = Math.round((dx * h) / 2);
+    const ky = Math.round((dy * h) / 2);
+    const snapped = cloneView(best.view);
+    if (kx || ky) pan(snapped, (kx * 2) / h, (ky * 2) / h);
+    const ex = (kx * 2) / h - dx;
+    const ey = (ky * 2) / h - dy;
+    return { layer: best, aligned: Math.abs(ex) * h < 1e-6 && Math.abs(ey) * h < 1e-6, snapped, dx: ex, dy: ey };
+  }
+
+  /**
+   * A view that has come to rest a fraction of a pixel off the grid of a careful
+   * picture of the same scale: how far to move it (in half-heights) to sit on that
+   * grid, so that the resting picture need only work out what is new. Null if there
+   * is no such picture or the view sits on its grid already.
+   */
+  align(now: View): [number, number] | null {
+    const g = this.grid(now, this.W, this.H, this.showTag);
+    return g && !g.aligned ? [g.dx, g.dy] : null;
   }
 
   /** The layer a new picture of `view` (h pixels high) overlaps best, to take its smooth parts from. */
@@ -798,7 +937,7 @@ export class Renderer {
     if (!L || L.tag === this.showTag) return;
     this.showTag = L.tag;
     this.layers = this.layers.filter((x) => x.tag === L.tag);
-    if (this.aa.layer && this.aa.layer.tag !== L.tag) this.aa = { layer: null, count: 0 };
+    if (this.aa.layer && this.aa.layer.tag !== L.tag) this.aa = { layer: null, count: 0, from: null };
     L.born = 0; // nothing of the old picture is left to fade from
   }
 
@@ -868,8 +1007,7 @@ export class Renderer {
     // limit on, and checked a little further.
     // (All this is for a picture at rest; one made on the move has no time to doubt.)
     const analytic = !!ref && ref.spec.kind === 'power';
-    const since = Math.max(1, job.busyAt - job.t0);
-    if (!more && !job.motion && patch >= 192 && job.N < Math.max(job.lastBusy, job.base) * (analytic ? 16 : 4) && now - job.busyAt < (analytic ? Math.max(2500, Math.min(8000, since * 2)) : 1200)) {
+    if (!more && !job.motion && patch >= 192 && job.N < Math.max(job.lastBusy, job.base) * (analytic ? 6 : 4) && now - job.busyAt < (analytic ? 2500 : 1200)) {
       more = true;
       job.doubts++;
     }
@@ -915,11 +1053,16 @@ export class Renderer {
   private startJob(now: View, isStatic: boolean, N: number, ref: RefGpu): Job | null {
     const exact = this.exactLayer(now);
     let aa = false;
-    let q = isStatic ? 1 : this.q;
+    // a dive keeps full resolution: it is the camera that gives way (see `behind`)
+    let q = isStatic || this.auto ? 1 : this.q;
     let jitter: [number, number] = [0, 0];
     if (exact && exact.tag === ref.tag) {
       if (!isStatic) return null;
-      if (this.aa.layer !== exact) this.aa = { layer: exact, count: 0 };
+      if (this.aa.layer !== exact) this.aa = { layer: exact, count: 0, from: null };
+      if (this.aaKFor !== exact) {
+        this.aaKFor = exact;
+        this.aaK = [0, 0];
+      }
       const n = 1 + this.aa.count;
       if (n >= this.aaTarget) return null;
       aa = true;
@@ -927,7 +1070,30 @@ export class Renderer {
       jitter = [halton(n, 2) - 0.5, halton(n, 3) - 0.5];
     }
     // while moving, aim at where the view will be when the picture is ready
-    const view = aa || isStatic ? cloneView(now) : this.ahead(now);
+    let view = aa || isStatic ? cloneView(now) : this.ahead(now);
+    // A view that was only dragged since a careful picture was made can sit on that
+    // picture's pixel grid: everything it knows is then taken over as it is, and
+    // only the strip that came into view is worked out.
+    let src: Layer | null = null;
+    let onGrid = false;
+    let share = 1;
+    if (!aa) {
+      const g = this.grid(view, Math.max(32, Math.round(this.W * q)), Math.max(32, Math.round(this.H * q)), ref.tag);
+      if (g && (g.aligned || !isStatic)) {
+        if (!isStatic) view = g.snapped;
+        src = g.layer;
+        onGrid = true;
+        // what is left to work out: the strip outside that picture, and what it does not know
+        const [ox, oy] = offsetIn(src.view, view);
+        const a = this.W / this.H;
+        const over = Math.max(0, 1 - Math.abs(ox) / (2 * a)) * Math.max(0, 1 - Math.abs(oy) / 2);
+        share = Math.max(0.05, 1 - over * (src.complete ? 1 : Math.min(1, src.known)));
+      } else if (!isStatic) {
+        src = this.source(view, Math.max(32, Math.round(this.H * q)), ref.tag);
+        if (src) share = 0;
+      }
+    }
+    const carry = aa && this.aa.from && this.aa.count < this.aa.from.count ? 1 : 0;
     const off = this.refOffset(view)!;
     const dmLen = Math.hypot(off.dm[0], off.dm[1]);
     if (!Number.isFinite(dmLen) || dmLen > 3000 || ref.prec < -view.ls + 40) return null;
@@ -944,7 +1110,7 @@ export class Renderer {
       this.resumeBase = 0;
       this.needIter = Math.min(this.maxN, want * GROW);
     }
-    const maxIter = Math.max(1, Math.min(want, ref.cap, this.maxN));
+    const maxIter = Math.max(1, Math.floor(Math.min(want, ref.cap, this.maxN)));
     return {
       id: ++this.jobSeq,
       view,
@@ -965,7 +1131,8 @@ export class Renderer {
       wantN: 0,
       lastActive: 1,
       lastBusy: 0,
-      lateN: 0,
+      // what is copied from a picture on the same grid needed that picture's limit
+      lateN: onGrid && src ? src.Naa : 0,
       ec,
       sm: Math.pow(2, view.ls - ec),
       dm: off.dm,
@@ -975,12 +1142,16 @@ export class Renderer {
       passes: 0,
       steps: 0,
       hsteps: 0,
-      K: Math.max(8, Math.min(4096, Math.round(this.targetMs / (this.c0 * w * h)))),
+      K: aa && this.aaK[carry] > 0 ? this.aaK[carry] : Math.max(8, Math.min(4096, Math.round(this.targetMs / (this.c0 * w * h * (share || 1))))),
       noBudget: false,
       tag: ref.tag,
       layer: aa ? exact : null,
       dirty: false,
-      src: aa || isStatic ? null : this.source(view, h, ref.tag),
+      src,
+      exact: onGrid,
+      share: aa ? 0 : share,
+      carry,
+      strict: aa || isStatic || onGrid,
       busyAt: performance.now(),
       roundAt: performance.now(),
       quiet: false,
@@ -1046,10 +1217,17 @@ export class Renderer {
     gl.uniform1i(u.uAccTex, 5);
     const from = job.aa ? job.layer : job.passes === 0 ? job.src : null;
     gl.uniform1i(u.uAccLayer, from ? from.slot : 0);
+    // an extra sample starts from the same sample of the picture before, where that lies on this grid
+    const af = job.aa && this.aa.layer === job.layer ? this.aa.from : null;
+    const ai = af && this.aa.count < af.count ? this.aa.count : -1;
+    this.bindTex(7, gl.TEXTURE_2D_ARRAY, this.aaTexs[1 - this.aaCur]);
+    gl.uniform1i(u.uAaFrom, 7);
+    gl.uniform1i(u.uAaLayer, job.passes === 0 ? ai : -1);
+    gl.uniform2i(u.uAaShift, af ? af.kx : 0, af ? af.ky : 0);
     gl.uniform1i(u.uSkipIn, !from ? 0 : job.aa ? 1 : 2);
     if (from && !job.aa) {
       const [dx, dy] = offsetIn(from.view, job.view);
-      gl.uniform4f(u.uSrcX, Math.pow(2, job.view.ls - from.view.ls), dx, dy, 0);
+      gl.uniform4f(u.uSrcX, Math.pow(2, job.view.ls - from.view.ls), dx, dy, job.exact ? 1 : 0);
       gl.uniform2f(u.uSrcSize, from.w, from.h);
     }
     gl.uniform2i(u.uAccMax, job.w - 1, job.h - 1);
@@ -1057,7 +1235,7 @@ export class Renderer {
     gl.uniform4f(u.uLref, ref.lref[0], ref.lref[1], ref.lref[2], ref.lref[3]);
     // looser linearisation while moving (faster), tighter for the resting picture
     // a fold's distance does not stretch with the tolerance: never widen for folded formulas
-    const bias0 = job.motion ? this.biasMotion : this.biasStatic;
+    const bias0 = job.strict ? this.biasStatic : this.biasMotion;
     const bias = ref.spec.kind === 'abs' ? Math.min(0, bias0) : bias0;
     gl.uniform1f(u.uBlaBias, bias);
     gl.uniform1f(u.uEps2, Math.pow(2, 2 * (EPS_L2 + bias)));
@@ -1141,11 +1319,12 @@ export class Renderer {
       gl.deleteQuery(t.q);
       if (gl.getParameter(ext.GPU_DISJOINT_EXT) || !(ms > 0)) continue;
       this.stats.gpuMs = ms;
-      if (t.first && !t.job.src && !t.job.aa) {
-        // (a pass that takes pixels over from an earlier picture says nothing about the cost of a step)
-        const c = ms / (t.K * t.job.w * t.job.h);
+      if (t.first && !t.job.aa && t.job.share >= 0.1) {
+        // (a pass that takes over an unknown part of an earlier picture says nothing about the cost of a step)
+        const c = ms / (t.K * t.job.w * t.job.h * t.job.share);
         this.c0 = this.c0 * 0.5 + c * 0.5;
       }
+      if (t.first && t.job.aa && t.job.layer === this.aaKFor) this.aaK[t.job.carry] = Math.max(8, Math.min(262144, (t.K * this.targetMs) / Math.max(ms, 0.05)));
       if (t.job === this.job) {
         const want = (t.K * this.targetMs) / Math.max(ms, 0.05);
         t.job.K = Math.max(8, Math.min(262144, Math.min(want, t.job.K * 2)));
@@ -1232,7 +1411,9 @@ export class Renderer {
   private snapshot(job: Job, final: boolean, t: number): void {
     let L = job.layer;
     if (!L) {
-      L = { slot: this.freeSlot(job), view: job.view, w: job.w, h: job.h, N: job.N, Naa: job.N, tag: job.tag, complete: false, known: 0, born: t, seq: ++this.layerSeq };
+      // one that takes over a picture on its grid is as dear as that was, and needs the limit that needed
+      const from = job.exact ? job.src : null;
+      L = { slot: this.freeSlot(job), view: job.view, w: job.w, h: job.h, N: job.N, Naa: from ? Math.min(job.N, from.Naa) : job.N, cost: from ? from.cost : 0, tag: job.tag, complete: false, known: 0, done: false, strict: job.strict, born: t, seq: ++this.layerSeq };
       this.layers.push(L);
       job.layer = L;
       // a picture of another formula or parameter waits out of sight, unless there is nothing else to show
@@ -1249,7 +1430,7 @@ export class Renderer {
     if (this.layers.length >= MAXL) {
       const out = this.evict(job);
       this.layers = this.layers.filter((x) => x !== out);
-      if (this.aa.layer === out) this.aa = { layer: null, count: 0 };
+      if (this.aa.layer === out) this.aa = { layer: null, count: 0, from: null };
     }
     for (let s = 0; s < MAXL; s++) if (!this.layers.some((x) => x.slot === s)) return s;
     return 0;
@@ -1312,7 +1493,7 @@ export class Renderer {
       const [dx, dy] = offsetIn(L.view, M.view);
       return !(Math.abs(dx) + r * a <= a * 1.0005 && Math.abs(dy) + r <= 1.0005);
     });
-    if (this.aa.layer && !this.layers.includes(this.aa.layer)) this.aa = { layer: null, count: 0 };
+    if (this.aa.layer && !this.layers.includes(this.aa.layer)) this.aa = { layer: null, count: 0, from: null };
   }
 
   /** Where a layer lies on a screen showing `now` (null: nowhere), and whether it covers all of it. */
@@ -1343,6 +1524,11 @@ export class Renderer {
       list.push({ L, at, cost: L === this.exact ? -1 : d >= 0 ? d : -0.4 * d });
     }
     list.sort((x, y) => x.cost - y.cost || y.L.seq - x.L.seq);
+    let behind = list.length ? 1 : 0;
+    for (const x of list) {
+      if (x.at.full && x.L.done) behind = Math.min(behind, Math.max(0, this.grain(x.L, now)));
+    }
+    this.behind = behind;
     // Just after a change of fractal there is nothing to draw yet. Drawing nothing at
     // all leaves the last frame on screen, which beats a black flash between two pictures.
     if (t < this.holdUntil && !list.some((x) => x.L.complete || x.L.known >= 0.3)) return;
@@ -1363,7 +1549,7 @@ export class Renderer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, direct ? null : this.compFbo);
     this.bindTex(0, gl.TEXTURE_2D_ARRAY, this.stackTex);
     gl.uniform1i(u.uStack, 0);
-    this.bindTex(1, gl.TEXTURE_2D_ARRAY, this.aaTex);
+    this.bindTex(1, gl.TEXTURE_2D_ARRAY, this.aaTexs[this.aaCur]);
     gl.uniform1i(u.uAA, 1);
     gl.uniform1i(u.uCount, list.length);
     this.stats.layers = list.length;

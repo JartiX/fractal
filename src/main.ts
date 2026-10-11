@@ -97,7 +97,9 @@ function iterCost(sp: Spec): { texels: number; gpu: number; ram: number } {
   const segs = sp.julia ? 2 : 1;
   const folded = sp.kind === 'abs';
   const texels = segs * (folded ? 2 : 1);
-  return { texels, gpu: 16 * texels + (folded ? 24 : 16) * segs, ram: (folded ? 260 : 182) * segs };
+  // main memory: the orbit as doubles and as texels, the table, and the copies in flight to the card
+  // (the table's working space is small: it is built in blocks, see bla.ts)
+  return { texels, gpu: 16 * texels + (folded ? 24 : 16) * segs, ram: (folded ? 180 : 100) * segs };
 }
 
 /** Work the iteration ceiling out of the limits and show it. */
@@ -212,6 +214,28 @@ function itersFor(ls: number): number {
 }
 
 const worker = new Worker(new URL('./refWorker.ts', import.meta.url), { type: 'module' });
+// Threads for the BLA table of a long orbit: most of the machine's, leaving some for the
+// picture itself. They are started here, when the first long orbit is asked for, and
+// wired straight to the reference worker.
+let tablePool = false;
+function startTablePool(): void {
+  if (tablePool) return;
+  tablePool = true;
+  const count = Math.min(8, Math.floor((navigator.hardwareConcurrency || 4) * 0.6));
+  if (count < 2) return;
+  try {
+    const ports: MessagePort[] = [];
+    for (let i = 0; i < count; i++) {
+      const w = new Worker(new URL('./blaWorker.ts', import.meta.url), { type: 'module' });
+      const ch = new MessageChannel();
+      w.postMessage({ port: ch.port1 }, [ch.port1]);
+      ports.push(ch.port2);
+    }
+    worker.postMessage({ type: 'pool', ports }, ports);
+  } catch {
+    // no threads to be had: the reference worker builds its tables alone
+  }
+}
 let refSeq = 0;
 // the deepest point seen in the last picture: the best place for a reference orbit
 let refHint: { p: Point; iters: number; inside: boolean; t: number } | null = null;
@@ -227,6 +251,7 @@ let lastHintRef = 0; // when a reference was last moved to a hint
 let refPending = false;
 let blaPending = false;
 let refMs = 0;
+let refOrbitMs = 0;
 
 worker.onmessage = (ev: MessageEvent<RefResult | BlaResult | FailResult>) => {
   const m = ev.data;
@@ -239,6 +264,7 @@ worker.onmessage = (ev: MessageEvent<RefResult | BlaResult | FailResult>) => {
     refPending = false;
     blaPending = false;
     refMs = m.ms;
+    refOrbitMs = m.msOrbit ?? m.ms;
     if (!renderer.setRef(m, pendingSame)) {
       outOfMemory('видеопамяти');
       return;
@@ -346,6 +372,7 @@ function manageRef(): void {
       jy: dblToFixed(jc.im, 0, prec),
     };
     refPending = true;
+    if (req.maxIter >= 200000) startTablePool();
     worker.postMessage(req);
     return;
   }
@@ -381,6 +408,7 @@ const dive = {
   target: null as Point | null,
   aim: null as Point | null, // glides towards the target; the camera follows the aim
   rate: 0, // current zoom rate, eased towards `speed`
+  pace: 1, // share of that rate the renderer can keep up with (see updateInput)
   lost: 0,
 };
 
@@ -521,6 +549,7 @@ function setDive(on: boolean, target: Point | null = null, out = false): void {
   dive.target = target;
   dive.aim = pointAt(view, 0, 0);
   dive.rate = 0;
+  dive.pace = 1;
   dive.lost = 0;
   if (on) dive.speed = (out ? -1 : 1) * (Math.abs(dive.speed) || 0.7);
   say(on ? (out ? 'Отдаление' : target ? 'Погружение к точке' : 'Автопогружение') : 'Стоп');
@@ -746,6 +775,12 @@ function updateInput(dt: number): void {
       } else if (!dive.auto) setDive(false);
       else dive.target = null;
     }
+    // The camera goes no faster than pictures come. Nobody steers a dive by hand, so
+    // nothing is lost by pacing it to the renderer: every frame on the way is then a
+    // finished one, and the further the picture falls behind, the slower the camera.
+    const pace = Math.max(0.08, Math.min(1, 1.25 - renderer.behind / 0.3));
+    dive.pace += (pace - dive.pace) * (1 - Math.exp(-dt * 5));
+    want *= dive.pace;
     dive.rate += (want - dive.rate) * (1 - Math.exp(-dt * 2.5));
     zoomAt(view, ax, ay, -dive.rate * dt);
     if (view.ls >= LS_MAX && dive.rate < 0) setDive(false);
@@ -913,19 +948,30 @@ function fitCanvas(): void {
 let last = performance.now();
 let lastView = cloneView(view);
 let stillSince = last;
+let unaligned = false; // the view has moved since it was last put on a picture's pixel grid
 let lastHud = 0;
 let lastSave = 0;
 let dirtyHash = false;
+// The display's frame time: the usual gap between frames. A frame that comes late is
+// followed by one that comes early, and a dropped one doubles the gap; the lower quartile
+// of the last gaps is neither. (The smallest gap seen would be an early frame's: far too
+// short, and the time allowed for a pass with it.)
 let nominal = 16.7;
+const gaps = new Float64Array(64);
+let gapCount = 0;
 
 function frame(t: number): void {
   const dtMs = Math.min(100, Math.max(1, t - last));
   last = t;
   const dt = dtMs / 1000;
   fps += (1000 / dtMs - fps) * 0.05;
-  nominal = Math.min(nominal * 1.002, dtMs);
+  gaps[gapCount++ & 63] = dtMs;
+  if (gapCount < 32) nominal = Math.min(nominal, Math.max(4, dtMs));
+  else if ((gapCount & 15) === 0) nominal = Math.max(2.5, Array.from(gaps).sort((a, b) => a - b)[16]);
   // at rest nothing on screen moves, so the picture may take most of each frame
-  renderer.targetMs = (window as any).__ms || (t - stillSince > 400 && !dive.on ? 13 : Math.max(2, Math.min(9, Math.max(nominal * 0.9 - renderer.stats.restMs, renderer.stats.restMs * 0.7 + 1))));
+  // (on a fast display no more than a frame and a half or so: the renderer keeps at most two
+  // passes in hand, and that is then the longest anything on screen can be held up)
+  renderer.targetMs = (window as any).__ms || (t - stillSince > 400 && !dive.on ? Math.min(13, nominal * 1.7) : Math.max(2, Math.min(9, Math.max(nominal * 0.9 - renderer.stats.restMs, renderer.stats.restMs * 0.7 + 1))));
   renderer.frameTime(dtMs, nominal);
 
   fitCanvas();
@@ -936,6 +982,17 @@ function frame(t: number): void {
     stillSince = t;
     lastView = cloneView(view);
     dirtyHash = true;
+    unaligned = true;
+  } else if (unaligned && !dive.on) {
+    // The view has just stopped. If it was only dragged since the last careful picture,
+    // a shift of under half a pixel puts it on that picture's grid, and everything
+    // already worked out can be kept as it is (see Renderer.align).
+    unaligned = false;
+    const c = renderer.align(view);
+    if (c) {
+      pan(view, c[0], c[1]);
+      lastView = cloneView(view);
+    }
   }
   if (morph && spec().julia) {
     const a = dt * 0.12;
@@ -944,7 +1001,8 @@ function frame(t: number): void {
   }
   manageRef();
   if (cycling) renderer.phase = (renderer.phase + dt * 0.03) % 2;
-  renderer.frame(view, t - stillSince > 150, itersFor(view.ls));
+  renderer.auto = dive.on;
+  renderer.frame(view, t - stillSince > 70, itersFor(view.ls));
 
   if (t - lastHud > 200) {
     lastHud = t;
@@ -1159,5 +1217,5 @@ function orbitAt(px: number, py: number, n: number): number[][] {
   setFormula: (id: string) => setFormula(FORMULAS.find((f) => f.id === id)!),
   setJulia,
   formulas: FORMULAS.map((f) => f.id),
-  info: () => ({ refMs, ref: renderer.ref && { M: renderer.ref.M, lenA: renderer.ref.lenA, cap: renderer.ref.cap, escaped: renderer.ref.escaped, levels: renderer.ref.blaLevels }, stats: renderer.stats, last: renderer.lastJob, q: renderer.q, N: renderer.finalN() || itersFor(view.ls), N0: itersFor(view.ls), per: renderer.ref && renderer.ref.perA, interior: renderer.ref && renderer.ref.interior }),
+  info: () => ({ refMs, refOrbitMs, ref: renderer.ref && { M: renderer.ref.M, lenA: renderer.ref.lenA, cap: renderer.ref.cap, escaped: renderer.ref.escaped, levels: renderer.ref.blaLevels }, stats: renderer.stats, last: renderer.lastJob, q: renderer.q, N: renderer.finalN() || itersFor(view.ls), N0: itersFor(view.ls), per: renderer.ref && renderer.ref.perA, interior: renderer.ref && renderer.ref.interior }),
 };
